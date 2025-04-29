@@ -312,7 +312,7 @@ async def handle_shop(update: Update, context: ContextTypes.DEFAULT_TYPE, params
         except Exception as inner_e: logger.error(f"Failed fallback in handle_shop: {inner_e}")
 
 
-# --- Modified handle_city_selection (Corrected Formatting Again) ---
+# --- Modified handle_city_selection (Corrected Formatting FINAL) ---
 async def handle_city_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     query = update.callback_query
     user_id = query.from_user.id # Added for logging
@@ -383,10 +383,9 @@ async def handle_city_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             escaped_size = helpers.escape_markdown(prod['size'], version=2)
                             escaped_price = helpers.escape_markdown(price_str, version=2)
                             escaped_qty = helpers.escape_markdown(str(prod['quantity']), version=2)
-                            # <<< REMOVED escaped_avail variable fetch >>>
                             # Create the formatted line WITH a standard Python newline \n
-                            # The MarkdownV2 parser should handle this correctly.
-                            message_text_parts.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty}\n") # <<< REMOVED escaped_avail
+                            # Removed the {escaped_avail} part
+                            message_text_parts.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty}\n")
 
                         # Add a blank line for spacing after the district's products
                         message_text_parts.append("\n")
@@ -2174,5 +2173,3 @@ async def handle_pay_single_item(update: Update, context: ContextTypes.DEFAULT_T
             # No need for extra query.answer() here as _show_crypto does it
 
 # --- END handle_pay_single_item ---
-
-# --- END OF FILE user.py ---

@@ -381,20 +381,24 @@ async def handle_city_selection(update: Update, context: ContextTypes.DEFAULT_TY
                         escaped_dist_name = helpers.escape_markdown(dist_name, version=2)
                         message_text_parts.append(f"{EMOJI_DISTRICT} *{escaped_dist_name}*:\n") # Keep newline after district name
 
-                        # Add product details to message text (one per line)
+                        # --- Build product list string for this district ---
+                        product_lines = [] # Create a temporary list for this district's products
                         for prod in products_in_district:
                             prod_emoji = PRODUCT_TYPES.get(prod['product_type'], DEFAULT_PRODUCT_EMOJI)
                             price_str = format_currency(prod['price'])
+                            # Escape parts individually
                             escaped_type = helpers.escape_markdown(prod['product_type'], version=2)
                             escaped_size = helpers.escape_markdown(prod['size'], version=2)
                             escaped_price = helpers.escape_markdown(price_str, version=2)
                             escaped_qty = helpers.escape_markdown(str(prod['quantity']), version=2)
                             escaped_avail = helpers.escape_markdown(available_label_short, version=2)
-                            # Ensure each product line ends with a newline and has indentation
-                            message_text_parts.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty} {escaped_avail}\\n") # Added indentation and confirmed newline
+                            # Create the formatted line *without* extra escaping on the newline itself
+                            product_lines.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty} {escaped_avail}")
 
-                        # <<< ADDED Optional Newline for spacing >>>
-                        message_text_parts.append("\n")
+                        # Join the product lines for *this district* with Markdown newlines
+                        district_product_text = "\\n".join(product_lines)
+                        message_text_parts.append(district_product_text + "\\n\\n") # Append the block with double newline for spacing
+                        # --- End building product list string ---
 
                         # Add district to list for button creation
                         districts_with_products_info.append((d_id, dist_name))
@@ -2175,5 +2179,3 @@ async def handle_pay_single_item(update: Update, context: ContextTypes.DEFAULT_T
 
             await _show_crypto_choices_for_basket(update, context, edit_message=True)
             # No need for extra query.answer() here as _show_crypto does it
-
-# --- END handle_pay_single_item ---

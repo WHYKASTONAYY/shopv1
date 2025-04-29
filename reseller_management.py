@@ -209,7 +209,7 @@ async def handle_reseller_toggle_status(update: Update, context: ContextTypes.DE
 
 
 # ========================================
-# --- Admin: Manage Reseller Discounts --- (Keep as is, uses pagination)
+# --- Admin: Manage Reseller Discounts --- (Pagination kept)
 # ========================================
 
 async def handle_manage_reseller_discounts_select_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
@@ -272,7 +272,7 @@ async def handle_manage_reseller_discounts_select_reseller(update: Update, conte
         await query.edit_message_text("❌ Error displaying list.", parse_mode=None)
 
 
-# --- Manage Specific Reseller Discounts (Keep handlers below as they are) ---
+# --- Manage Specific Reseller Discounts ---
 
 async def handle_manage_specific_reseller_discounts(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Displays current discounts for a specific reseller and allows adding/editing."""
@@ -334,6 +334,7 @@ async def handle_manage_specific_reseller_discounts(update: Update, context: Con
         await query.edit_message_text("❌ Error displaying discounts.", parse_mode=None)
 
 
+# <<< FIXED >>>
 async def handle_reseller_add_discount_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Admin selects product type for a new reseller discount rule."""
     query = update.callback_query
@@ -343,6 +344,9 @@ async def handle_reseller_add_discount_select_type(update: Update, context: Cont
         await query.answer("Error: Invalid user ID.", show_alert=True); return
 
     target_reseller_id = int(params[0])
+    # <<< STORE the target ID in context >>>
+    context.user_data['reseller_mgmt_target_id'] = target_reseller_id
+
     load_all_data() # Ensure PRODUCT_TYPES is fresh
 
     if not PRODUCT_TYPES:
@@ -351,32 +355,48 @@ async def handle_reseller_add_discount_select_type(update: Update, context: Cont
 
     keyboard = []
     for type_name, emoji in sorted(PRODUCT_TYPES.items()):
-        keyboard.append([InlineKeyboardButton(f"{emoji} {type_name}", callback_data=f"reseller_add_discount_enter_percent|{target_reseller_id}|{type_name}")])
+        # <<< MODIFIED callback_data: Only command and type_name >>>
+        callback_data_short = f"reseller_add_discount_enter_percent|{type_name}"
+        # <<< ADDED length check >>>
+        if len(callback_data_short.encode('utf-8')) > 64:
+            logger.warning(f"Callback data for type '{type_name}' is too long ({len(callback_data_short.encode('utf-8'))} bytes) and will be skipped: {callback_data_short}")
+            continue # Skip this button if the data is too long
+        keyboard.append([InlineKeyboardButton(f"{emoji} {type_name}", callback_data=callback_data_short)])
 
+    # Cancel button still needs the target_id to go back correctly
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data=f"reseller_manage_specific|{target_reseller_id}")])
     await query.edit_message_text("Select Product Type for new discount rule:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
 
 
+# <<< FIXED >>>
 async def handle_reseller_add_discount_enter_percent(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Admin needs to enter the percentage for the new rule."""
     query = update.callback_query
     admin_id = query.from_user.id
     if admin_id != ADMIN_ID: return await query.answer("Access Denied.", show_alert=True)
-    if not params or len(params) < 2 or not params[0].isdigit():
-        await query.answer("Error: Invalid data.", show_alert=True); return
 
-    target_reseller_id = int(params[0])
-    product_type = params[1]
+    # <<< RETRIEVE target ID from context >>>
+    target_reseller_id = context.user_data.get('reseller_mgmt_target_id')
+
+    # <<< Params now only contain the product_type >>>
+    if not params or len(params) < 1 or target_reseller_id is None:
+        logger.error("handle_reseller_add_discount_enter_percent missing context or params.")
+        await query.answer("Error: Missing data.", show_alert=True); return
+
+    product_type = params[0] # Get type from params
     emoji = PRODUCT_TYPES.get(product_type, DEFAULT_PRODUCT_EMOJI)
 
     context.user_data['state'] = 'awaiting_reseller_discount_percent'
-    context.user_data['reseller_mgmt_target_id'] = target_reseller_id
+    # reseller_mgmt_target_id is already in context
     context.user_data['reseller_mgmt_product_type'] = product_type
     context.user_data['reseller_mgmt_mode'] = 'add'
 
+    # Cancel button still needs the target_id
+    cancel_callback = f"reseller_manage_specific|{target_reseller_id}"
+
     await query.edit_message_text(
         f"Enter discount percentage for {emoji} {product_type} (e.g., 10 or 15.5):",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"reseller_manage_specific|{target_reseller_id}")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)]]),
         parse_mode=None
     )
     await query.answer("Enter percentage in chat.")
@@ -399,9 +419,12 @@ async def handle_reseller_edit_discount(update: Update, context: ContextTypes.DE
     context.user_data['reseller_mgmt_product_type'] = product_type
     context.user_data['reseller_mgmt_mode'] = 'edit'
 
+    # Cancel button still needs the target_id
+    cancel_callback = f"reseller_manage_specific|{target_reseller_id}"
+
     await query.edit_message_text(
         f"Enter *new* discount percentage for {emoji} {product_type} (e.g., 10 or 15.5):",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"reseller_manage_specific|{target_reseller_id}")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=cancel_callback)]]),
         parse_mode=None
     )
     await query.answer("Enter new percentage in chat.")
@@ -424,6 +447,10 @@ async def handle_reseller_percent_message(update: Update, context: ContextTypes.
         logger.error("State awaiting_reseller_discount_percent missing context data.")
         await send_message_with_retry(context.bot, chat_id, "❌ Error: Context lost. Please start again.", parse_mode=None)
         context.user_data.pop('state', None)
+        # Clean up other related context data as well
+        context.user_data.pop('reseller_mgmt_target_id', None)
+        context.user_data.pop('reseller_mgmt_product_type', None)
+        context.user_data.pop('reseller_mgmt_mode', None)
         fallback_cb = "manage_reseller_discounts_select_reseller|0"
         await send_message_with_retry(context.bot, chat_id, "Returning...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=fallback_cb)]]), parse_mode=None)
         return
@@ -450,7 +477,10 @@ async def handle_reseller_percent_message(update: Update, context: ContextTypes.
             # Use INSERT OR REPLACE for both add and edit to simplify logic
             # If it's an 'edit' but the row doesn't exist, it becomes an 'add'
             sql = "INSERT OR REPLACE INTO reseller_discounts (reseller_user_id, product_type, discount_percentage) VALUES (?, ?, ?)"
-            params_sql = (target_user_id, product_type, float(percentage))
+            # Use quantize before converting to float for DB storage if needed, or store as TEXT
+            # Storing as REAL (float) is generally fine for percentages if precision issues are acceptable,
+            # but TEXT is safer if exact Decimal values are critical. Let's stick with REAL for now.
+            params_sql = (target_user_id, product_type, float(percentage.quantize(Decimal("0.1")))) # Store with one decimal place
 
             # Determine action description based on whether old value existed
             action_desc = ACTION_RESELLER_DISCOUNT_ADD if old_value is None else ACTION_RESELLER_DISCOUNT_EDIT
@@ -461,13 +491,14 @@ async def handle_reseller_percent_message(update: Update, context: ContextTypes.
             # Log the action
             log_admin_action(
                 admin_id=admin_id, action=action_desc, target_user_id=target_user_id,
-                reason=f"Type: {product_type}", old_value=old_value, new_value=float(percentage)
+                reason=f"Type: {product_type}", old_value=old_value, new_value=params_sql[2] # Log the value stored
             )
 
             action_verb = "set" if old_value is None else "updated"
             await send_message_with_retry(context.bot, chat_id, f"✅ Discount rule {action_verb} for {product_type}: {percentage:.1f}%",
                                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=back_callback)]]), parse_mode=None)
 
+            # Clean up context after successful operation
             context.user_data.pop('state', None); context.user_data.pop('reseller_mgmt_target_id', None)
             context.user_data.pop('reseller_mgmt_product_type', None); context.user_data.pop('reseller_mgmt_mode', None)
 
@@ -476,6 +507,10 @@ async def handle_reseller_percent_message(update: Update, context: ContextTypes.
             if conn and conn.in_transaction: conn.rollback()
             await send_message_with_retry(context.bot, chat_id, "❌ DB Error saving discount rule.", parse_mode=None)
             context.user_data.pop('state', None) # Clear state on error
+            # Clean up other related context data on error
+            context.user_data.pop('reseller_mgmt_target_id', None)
+            context.user_data.pop('reseller_mgmt_product_type', None)
+            context.user_data.pop('reseller_mgmt_mode', None)
         finally:
             if conn: conn.close()
 

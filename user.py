@@ -223,26 +223,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = get_db_connection()
             c = conn.cursor()
             # Ensure user exists
-            # <<< MODIFIED: Include is_reseller default in insert/update >>>
             c.execute("""
                 INSERT INTO users (user_id, username, language, is_reseller) VALUES (?, ?, 'en', 0)
                 ON CONFLICT(user_id) DO UPDATE SET username=excluded.username
             """, (user_id, username))
-            # <<< END MODIFIED >>>
             # Get language
             c.execute("SELECT language FROM users WHERE user_id = ?", (user_id,))
             result = c.fetchone()
             db_lang = result['language'] if result else 'en'
-            # Need LANGUAGES here too
             try: from utils import LANGUAGES as UTILS_LANGUAGES_START
             except ImportError: UTILS_LANGUAGES_START = {'en': {}}
             lang = db_lang if db_lang and db_lang in UTILS_LANGUAGES_START else 'en'
             conn.commit()
-            context.user_data["lang"] = lang # Store in context
+            context.user_data["lang"] = lang
             logger.info(f"start: Set language for user {user_id} to '{lang}' from DB/default.")
         except sqlite3.Error as e:
             logger.error(f"DB error ensuring user/language in start for {user_id}: {e}")
-            lang = 'en' # Default on error
+            lang = 'en'
             context.user_data["lang"] = lang
             logger.warning(f"start: Defaulted language to 'en' for user {user_id} due to DB error.")
         finally:
@@ -251,17 +248,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"start: Using existing language '{lang}' from context for user {user_id}.")
 
     # Build and Send/Edit Menu
-    lang, lang_data = _get_lang_data(context) # Get final language data again after ensuring it's set
+    lang, lang_data = _get_lang_data(context)
     full_welcome, reply_markup = _build_start_menu_content(user_id, username, lang_data, context)
 
     if is_callback:
         query = update.callback_query
         try:
-             # Only edit if message content or markup has changed
              if query.message and (query.message.text != full_welcome or query.message.reply_markup != reply_markup):
-                  # Send with parse_mode=None as formatting is handled internally or should be plain
                   await query.edit_message_text(full_welcome, reply_markup=reply_markup, parse_mode=None)
-             elif query: await query.answer() # Acknowledge if not modified
+             elif query: await query.answer()
         except telegram_error.BadRequest as e:
               if "message is not modified" not in str(e).lower():
                   logger.warning(f"Failed to edit start message (callback): {e}. Sending new.")
@@ -271,8 +266,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
              logger.error(f"Unexpected error editing start message (callback): {e}", exc_info=True)
              await send_message_with_retry(context.bot, chat_id, full_welcome, reply_markup=reply_markup, parse_mode=None)
     else:
-        # Send the main welcome message *after* attempting to send the media
-        # Send with parse_mode=None as formatting is handled internally or should be plain
         await send_message_with_retry(context.bot, chat_id, full_welcome, reply_markup=reply_markup, parse_mode=None)
 
 
@@ -390,10 +383,10 @@ async def handle_city_selection(update: Update, context: ContextTypes.DEFAULT_TY
                             escaped_size = helpers.escape_markdown(prod['size'], version=2)
                             escaped_price = helpers.escape_markdown(price_str, version=2)
                             escaped_qty = helpers.escape_markdown(str(prod['quantity']), version=2)
-                            escaped_avail = helpers.escape_markdown(available_label_short, version=2)
+                            # <<< REMOVED escaped_avail variable fetch >>>
                             # Create the formatted line WITH a standard Python newline \n
                             # The MarkdownV2 parser should handle this correctly.
-                            message_text_parts.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty} {escaped_avail}\n") # Use standard \n
+                            message_text_parts.append(f"    • {prod_emoji} {escaped_type} {escaped_size} \\({escaped_price}€\\) \\- {escaped_qty}\n") # <<< REMOVED escaped_avail
 
                         # Add a blank line for spacing after the district's products
                         message_text_parts.append("\n")
@@ -2179,3 +2172,7 @@ async def handle_pay_single_item(update: Update, context: ContextTypes.DEFAULT_T
 
             await _show_crypto_choices_for_basket(update, context, edit_message=True)
             # No need for extra query.answer() here as _show_crypto does it
+
+# --- END handle_pay_single_item ---
+
+# --- END OF FILE user.py ---

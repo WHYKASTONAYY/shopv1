@@ -55,8 +55,8 @@ try:
         handle_viewer_admin_menu,
         handle_manage_users_start, # <-- Needed for the new button
         # Import other viewer handlers if needed elsewhere in admin.py
-        handle_viewer_added_products,
-        handle_viewer_view_product_media
+        handle_viewer_added_products, # <<< NEED THIS
+        handle_viewer_view_product_media # <<< NEED THIS
     )
 except ImportError:
     logger_dummy_viewer = logging.getLogger(__name__ + "_dummy_viewer")
@@ -73,8 +73,16 @@ except ImportError:
         if query: await query.edit_message_text(msg, parse_mode=None)
         else: await send_message_with_retry(context.bot, update.effective_chat.id, msg, parse_mode=None)
     # Add dummies for other viewer handlers if they were used directly in admin.py
-    async def handle_viewer_added_products(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None): pass
-    async def handle_viewer_view_product_media(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None): pass
+    async def handle_viewer_added_products(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
+        query = update.callback_query
+        msg = "Added Products Log handler not found."
+        if query: await query.edit_message_text(msg, parse_mode=None)
+        else: await send_message_with_retry(context.bot, update.effective_chat.id, msg, parse_mode=None)
+    async def handle_viewer_view_product_media(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
+        query = update.callback_query
+        msg = "View Product Media handler not found."
+        if query: await query.edit_message_text(msg, parse_mode=None)
+        else: await send_message_with_retry(context.bot, update.effective_chat.id, msg, parse_mode=None)
 # ------------------------------------
 
 # --- Import Reseller Management Handlers ---
@@ -378,7 +386,17 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if is_secondary_admin and not is_primary_admin:
         logger.info(f"Redirecting secondary admin {user_id} to viewer admin menu.")
-        return await handle_viewer_admin_menu(update, context)
+        # Ensure the viewer_admin handler is correctly imported and called
+        try:
+            # Assuming handle_viewer_admin_menu is imported correctly above
+            return await handle_viewer_admin_menu(update, context)
+        except NameError:
+            logger.error("handle_viewer_admin_menu not found, check imports.")
+            fallback_msg = "Viewer admin menu handler is missing."
+            if query: await query.edit_message_text(fallback_msg)
+            else: await send_message_with_retry(context.bot, chat_id, fallback_msg)
+            return
+
 
     # --- Primary Admin Dashboard ---
     total_users, total_user_balance, active_products, total_sales_value = 0, Decimal('0.0'), 0, Decimal('0.0')
@@ -420,16 +438,18 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
        "Select an action:"
     )
 
+    # <<< UPDATED Keyboard with Added Products Log >>>
     keyboard = [
         [InlineKeyboardButton("📊 Sales Analytics", callback_data="sales_analytics_menu")],
         [InlineKeyboardButton("➕ Add Products", callback_data="adm_city")],
         [InlineKeyboardButton("🗑️ Manage Products", callback_data="adm_manage_products")],
         [InlineKeyboardButton("👥 Manage Users", callback_data="adm_manage_users|0")],
-        [InlineKeyboardButton("👑 Manage Resellers", callback_data="manage_resellers_menu")], # <<< ADDED
-        [InlineKeyboardButton("🏷️ Manage Reseller Discounts", callback_data="manage_reseller_discounts_select_reseller|0")], # <<< ADDED
-        [InlineKeyboardButton("🏷️ Manage Discount Codes", callback_data="adm_manage_discounts")], # Kept General Discounts
-        [InlineKeyboardButton("👋 Manage Welcome Msg", callback_data="adm_manage_welcome|0")], # Default to page 0
+        [InlineKeyboardButton("👑 Manage Resellers", callback_data="manage_resellers_menu")],
+        [InlineKeyboardButton("🏷️ Manage Reseller Discounts", callback_data="manage_reseller_discounts_select_reseller|0")],
+        [InlineKeyboardButton("🏷️ Manage Discount Codes", callback_data="adm_manage_discounts")],
+        [InlineKeyboardButton("👋 Manage Welcome Msg", callback_data="adm_manage_welcome|0")],
         [InlineKeyboardButton("📦 View Bot Stock", callback_data="view_stock")],
+        [InlineKeyboardButton("📜 View Added Products Log", callback_data="viewer_added_products|0")], # <<< ADDED HERE
         [InlineKeyboardButton("🗺️ Manage Districts", callback_data="adm_manage_districts")],
         [InlineKeyboardButton("🏙️ Manage Cities", callback_data="adm_manage_cities")],
         [InlineKeyboardButton("🧩 Manage Product Types", callback_data="adm_manage_types")],
@@ -447,12 +467,15 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         except telegram_error.BadRequest as e:
             if "message is not modified" not in str(e).lower():
                 logger.error(f"Error editing admin menu message: {e}")
+                # Attempt to send as new message if edit fails catastrophically
                 await send_message_with_retry(context.bot, chat_id, msg, reply_markup=reply_markup, parse_mode=None)
-            else: await query.answer()
+            else: # Message not modified is fine, just answer the query
+                await query.answer()
         except Exception as e:
             logger.error(f"Unexpected error editing admin menu: {e}", exc_info=True)
+            # Attempt to send as new message on unexpected error
             await send_message_with_retry(context.bot, chat_id, msg, reply_markup=reply_markup, parse_mode=None)
-    else:
+    else: # Called by /admin command
         await send_message_with_retry(context.bot, chat_id, msg, reply_markup=reply_markup, parse_mode=None)
 
 
@@ -763,23 +786,13 @@ async def handle_confirm_add_drop(update: Update, context: ContextTypes.DEFAULT_
     product_name = f"{p_type} {size} {int(time.time())}"; conn = None; product_id = None
     try:
         conn = get_db_connection(); c = conn.cursor(); c.execute("BEGIN")
-        # <<< CORRECTED: Use explicit tuple definition and add logging >>>
         insert_params = (
-            city,            # 1
-            district,        # 2
-            p_type,          # 3
-            size,            # 4
-            product_name,    # 5
-            price,           # 6
-            original_text,   # 7
-            ADMIN_ID,        # 8
-            datetime.now(timezone.utc).isoformat() # 9
+            city, district, p_type, size, product_name, price, original_text, ADMIN_ID, datetime.now(timezone.utc).isoformat()
         )
         logger.debug(f"Inserting product with params count: {len(insert_params)}") # Add debug log
         c.execute("""INSERT INTO products
                         (city, district, product_type, size, name, price, available, reserved, original_text, added_by, added_date)
                      VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?, ?)""", insert_params)
-        # <<< END CORRECTION >>>
         product_id = c.lastrowid
 
         if product_id and media_list and temp_dir:
@@ -1392,7 +1405,7 @@ async def handle_adm_manage_discounts(update: Update, context: ContextTypes.DEFA
                 toggle_text = "Deactivate" if code['is_active'] else "Activate"
                 delete_text = "🗑️ Delete"
                 code_text = code['code']
-                msg += f"{code_text} ({value_str} {code['discount_type']}) | {status} | Used: {usage}{expiry_info}\n"
+                msg += f"`{code_text}` ({value_str} {code['discount_type']}) | {status} | Used: {usage}{expiry_info}\n" # Use markdown for code
                 keyboard.append([
                     InlineKeyboardButton(f"{'❌' if code['is_active'] else '✅'} {toggle_text}", callback_data=f"adm_toggle_discount|{code['id']}"),
                     InlineKeyboardButton(f"{delete_text}", callback_data=f"adm_delete_discount|{code['id']}")
@@ -1402,10 +1415,19 @@ async def handle_adm_manage_discounts(update: Update, context: ContextTypes.DEFA
             [InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")]
         ])
         try:
-            await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+             # Use MarkdownV2 for code formatting
+            await query.edit_message_text(helpers.escape_markdown(msg, version=2), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
         except telegram_error.BadRequest as e:
-             if "message is not modified" not in str(e).lower(): logger.error(f"Error editing discount list: {e}.")
-             else: await query.answer()
+             if "message is not modified" not in str(e).lower():
+                 logger.error(f"Error editing discount list (MarkdownV2): {e}. Falling back to plain.")
+                 try:
+                     # Fallback to plain text
+                     plain_msg = msg.replace('`', '') # Simple removal
+                     await query.edit_message_text(plain_msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+                 except Exception as fallback_e:
+                     logger.error(f"Error editing discount list (Fallback): {fallback_e}")
+                     await query.answer("Error updating list.", show_alert=True)
+             else: await query.answer() # Ignore not modified
     except sqlite3.Error as e:
         logger.error(f"DB error loading discount codes: {e}", exc_info=True)
         await query.edit_message_text("❌ Error loading discount codes.", parse_mode=None)
@@ -1459,14 +1481,19 @@ async def handle_adm_delete_discount(update: Update, context: ContextTypes.DEFAU
         if not result: return await query.answer("Code not found.", show_alert=True)
         code_text = result['code']
         context.user_data["confirm_action"] = f"delete_discount|{code_id}"
-        msg = (f"⚠️ Confirm Deletion\n\nAre you sure you want to permanently delete discount code: {code_text}?\n\n"
+        msg = (f"⚠️ Confirm Deletion\n\nAre you sure you want to permanently delete discount code: `{helpers.escape_markdown(code_text, version=2)}`?\n\n"
                f"🚨 This action is irreversible!")
         keyboard = [[InlineKeyboardButton("✅ Yes, Delete Code", callback_data="confirm_yes"),
                      InlineKeyboardButton("❌ No, Cancel", callback_data="adm_manage_discounts")]]
-        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN_V2)
     except (sqlite3.Error, ValueError) as e:
         logger.error(f"Error preparing delete confirmation for discount code {params[0]}: {e}", exc_info=True)
         await query.answer("Error fetching code details.", show_alert=True)
+    except telegram_error.BadRequest as e_tg:
+         # Fallback if Markdown fails
+         logger.warning(f"Markdown error displaying delete confirm: {e_tg}. Falling back.")
+         msg_plain = msg.replace('`', '') # Simple removal
+         await query.edit_message_text(msg_plain, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
     finally:
         if conn: conn.close() # Close connection if opened
 
@@ -3410,3 +3437,5 @@ async def handle_adm_welcome_description_edit_message(update: Update, context: C
     context.user_data.pop("editing_welcome_template_name", None) # Clean up specific edit state
     context.user_data.pop("editing_welcome_field", None) # Clean up field indicator
     await _show_welcome_preview(update, context)
+
+# --- END OF FILE admin.py ---

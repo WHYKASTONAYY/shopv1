@@ -604,7 +604,8 @@ async def process_successful_refill(user_id: int, amount_to_add_eur: Decimal, pa
         if conn: conn.close()
 
 
-# --- HELPER: Finalize Purchase (Shared Logic - Modified for Reseller Price) ---
+# --- HELPER: Finalize Purchase (Shared Logic - Modified for Reseller Price and Media Handling) ---
+# <<< START REPLACEMENT >>>
 async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_used: str | None, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Shared logic to finalize a purchase after payment confirmation (balance or crypto).
@@ -658,7 +659,15 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
             # --- Calculate Price Paid (Original - Reseller Discount) ---
             item_original_price_decimal = Decimal(str(details['price']))
             item_product_type = details['product_type']
-            item_reseller_discount_percent = get_reseller_discount(user_id, item_product_type)
+            item_reseller_discount_percent = Decimal('0.0') # Default to 0
+            # Use try-except for safety, although the original log shows it failed before this point
+            try:
+                # Attempt to get reseller discount (run sync function in thread)
+                item_reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, item_product_type)
+            except Exception as e:
+                logger.error(f"Error calling get_reseller_discount for user {user_id} type {item_product_type}: {e}")
+                # Continue with 0% discount if there's an error
+
             item_reseller_discount_amount = (item_original_price_decimal * item_reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
             item_price_paid_decimal = item_original_price_decimal - item_reseller_discount_amount
             # --- End Calculation ---
@@ -734,90 +743,150 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 if not item_details_list: continue
                 item_details = item_details_list[0]
                 item_name, item_size = item_details['name'], item_details['size']
-                item_text = item_details['text'] or "(No specific pickup details provided)"
+                item_original_text = item_details['text'] or "(No specific pickup details provided)" # Renamed for clarity
                 product_type = product_db_details.get(prod_id, {}).get('product_type', 'Product')
                 product_emoji = PRODUCT_TYPES.get(product_type, DEFAULT_PRODUCT_EMOJI)
                 item_header = f"--- Item: {product_emoji} {item_name} {item_size} ---"
 
-                media_sent = False; caption_sent_with_media = False; opened_files = []
-                if prod_id in media_details:
-                     media_list = media_details[prod_id]
-                     if media_list:
-                        media_group_to_send = []
-                        combined_caption = f"{item_header}\n\n{item_text}"
-                        if len(combined_caption) > 1024: combined_caption = combined_caption[:1021] + "..."
+                # Prepare caption
+                combined_caption = f"{item_header}\n\n{item_original_text}"
+                if len(combined_caption) > 1024: combined_caption = combined_caption[:1021] + "..."
+
+                media_to_send_separately = [] # Store tuples (type, file_id, file_path)
+                photo_video_group = []
+                opened_files = []
+                media_items_for_product = media_details.get(prod_id, [])
+                caption_sent_flag = False # Track if caption has been sent
+
+                # --- Separate Media Types ---
+                for media_item in media_items_for_product:
+                    media_type = media_item.get('media_type')
+                    file_id = media_item.get('telegram_file_id')
+                    file_path = media_item.get('file_path')
+
+                    if media_type in ['photo', 'video']:
+                        # Prepare InputMedia for grouping
+                        input_media = None; file_handle = None
                         try:
-                            for i, media_item in enumerate(media_list):
-                                file_id = media_item.get('telegram_file_id')
-                                media_type = media_item.get('media_type')
-                                file_path = media_item.get('file_path')
-                                caption_to_use = combined_caption if i == 0 else None
-                                input_media = None; file_handle = None
-                                try:
-                                    if file_id:
-                                        if media_type == 'photo': input_media = InputMediaPhoto(media=file_id, caption=caption_to_use, parse_mode=None)
-                                        elif media_type == 'video': input_media = InputMediaVideo(media=file_id, caption=caption_to_use, parse_mode=None)
-                                        elif media_type == 'gif': input_media = InputMediaAnimation(media=file_id, caption=caption_to_use, parse_mode=None)
-                                        else: logger.warning(f"Unsupported media type '{media_type}' with file_id P{prod_id}"); continue
-                                    elif file_path and await asyncio.to_thread(os.path.exists, file_path):
-                                        logger.info(f"Opening media file {file_path} P{prod_id} for sending")
-                                        file_handle = await asyncio.to_thread(open, file_path, 'rb')
-                                        opened_files.append(file_handle)
-                                        if media_type == 'photo': input_media = InputMediaPhoto(media=file_handle, caption=caption_to_use, parse_mode=None)
-                                        elif media_type == 'video': input_media = InputMediaVideo(media=file_handle, caption=caption_to_use, parse_mode=None)
-                                        elif media_type == 'gif': input_media = InputMediaAnimation(media=file_handle, caption=caption_to_use, parse_mode=None)
-                                        else: logger.warning(f"Unsupported media type '{media_type}' from path {file_path}"); await asyncio.to_thread(file_handle.close); opened_files.remove(file_handle); continue
-                                    else: logger.warning(f"Media item invalid P{prod_id}: No file_id and path '{file_path}' missing."); continue
-                                    if input_media: media_group_to_send.append(input_media)
-                                except Exception as prep_e:
-                                    logger.error(f"Error preparing media item {i+1} P{prod_id}: {prep_e}", exc_info=True)
-                                    if file_handle and file_handle in opened_files: await asyncio.to_thread(file_handle.close); opened_files.remove(file_handle)
-                            if media_group_to_send:
-                                await context.bot.send_media_group(chat_id, media=media_group_to_send, connect_timeout=20, read_timeout=20)
-                                logger.info(f"Sent media group with {len(media_group_to_send)} items for P{prod_id} to user {user_id}.")
-                                media_sent = True
-                                if media_group_to_send[0].caption: caption_sent_with_media = True
-                        except telegram_error.TelegramError as tg_err: logger.error(f"TelegramError sending media group for P{prod_id} to user {user_id}: {tg_err}"); caption_sent_with_media = False
-                        except Exception as e: logger.error(f"Unexpected error sending media group for P{prod_id} user {user_id}: {e}", exc_info=True); caption_sent_with_media = False
-                        finally:
-                            for f in opened_files:
-                                try:
-                                    if not f.closed: await asyncio.to_thread(f.close); logger.debug(f"Closed file handle during cleanup: {getattr(f, 'name', 'unknown')}")
-                                except Exception as close_e: logger.warning(f"Error closing file handle '{getattr(f, 'name', 'unknown')}' during cleanup: {close_e}")
+                            if file_id:
+                                if media_type == 'photo': input_media = InputMediaPhoto(media=file_id)
+                                elif media_type == 'video': input_media = InputMediaVideo(media=file_id)
+                            elif file_path and await asyncio.to_thread(os.path.exists, file_path):
+                                file_handle = await asyncio.to_thread(open, file_path, 'rb')
+                                opened_files.append(file_handle)
+                                if media_type == 'photo': input_media = InputMediaPhoto(media=file_handle)
+                                elif media_type == 'video': input_media = InputMediaVideo(media=file_handle)
+                            if input_media: photo_video_group.append(input_media)
+                            else: logger.warning(f"Could not prepare photo/video InputMedia P{prod_id}: {media_item}")
+                        except Exception as prep_e:
+                             logger.error(f"Error preparing photo/video InputMedia P{prod_id}: {prep_e}", exc_info=True)
+                             if file_handle and file_handle in opened_files:
+                                try: await asyncio.to_thread(file_handle.close); opened_files.remove(file_handle)
+                                except Exception: pass
+                    elif media_type == 'gif':
+                        # Store info for sending separately
+                        media_to_send_separately.append(('gif', file_id, file_path))
+                    else:
+                        logger.warning(f"Unsupported media type '{media_type}' found for P{prod_id}")
 
-                # Send Text Details ONLY if no media or caption failed
-                if not media_sent or not caption_sent_with_media:
-                    text_to_send = item_text if media_sent else f"{item_header}\n\n{item_text}"
-                    if not text_to_send: text_to_send = f"(No details for {item_name} {item_size})"
-                    await send_message_with_retry(context.bot, chat_id, text_to_send, parse_mode=None)
+                # --- Send Photos/Videos Group ---
+                try:
+                    if photo_video_group:
+                        # Attach caption to the first item IF no separate media will be sent after it
+                        if not media_to_send_separately:
+                            photo_video_group[0].caption = combined_caption
+                            photo_video_group[0].parse_mode = None # Ensure parse mode is None
+                            caption_sent_flag = True
 
-        # Delete Product Records and Media Directories Async
-        conn_del = None
-        try:
-            conn_del = get_db_connection()
-            c_del = conn_del.cursor()
-            ids_tuple_list = [(pid,) for pid in processed_product_ids]
-            c_del.executemany("DELETE FROM product_media WHERE product_id = ?", ids_tuple_list)
-            delete_result = c_del.executemany("DELETE FROM products WHERE id = ?", ids_tuple_list)
-            conn_del.commit()
-            deleted_count = delete_result.rowcount
-            logger.info(f"Attempted deletion of {len(processed_product_ids)} purchased product records (Result: {deleted_count}).")
-            for prod_id in processed_product_ids:
-                 media_dir_to_delete = os.path.join(MEDIA_DIR, str(prod_id))
-                 if await asyncio.to_thread(os.path.exists, media_dir_to_delete):
-                     asyncio.create_task(asyncio.to_thread(shutil.rmtree, media_dir_to_delete, ignore_errors=True))
-                     logger.info(f"Scheduled deletion of media dir: {media_dir_to_delete}")
-        except sqlite3.Error as e: logger.error(f"DB error deleting purchased products: {e}", exc_info=True); conn_del.rollback() if conn_del and conn_del.in_transaction else None
-        except Exception as e: logger.error(f"Unexpected error deleting purchased products: {e}", exc_info=True)
-        finally:
-            if conn_del: conn_del.close()
+                        await context.bot.send_media_group(chat_id, media=photo_video_group, connect_timeout=20, read_timeout=20)
+                        logger.info(f"Sent photo/video group ({len(photo_video_group)}) for P{prod_id} user {user_id}.")
+                except Exception as group_e:
+                    logger.error(f"Error sending photo/video group P{prod_id}: {group_e}")
+                    caption_sent_flag = False # Ensure caption is sent separately if group fails
 
-        # Final Message
-        if chat_id:
-             final_message_parts = ["Purchase details sent above."]
-             leave_review_button = lang_data.get("leave_review_button", "Leave a Review")
-             keyboard = [[InlineKeyboardButton(f"✍️ {leave_review_button}", callback_data="leave_review_now")]]
-             await send_message_with_retry(context.bot, chat_id, "\n\n".join(final_message_parts), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+                # --- Send Animations (GIFs) Separately ---
+                for anim_idx, (anim_type, anim_file_id, anim_file_path) in enumerate(media_to_send_separately):
+                    # Send caption with the *first* animation if it wasn't sent with the photo/video group
+                    caption_for_anim = combined_caption if not caption_sent_flag and anim_idx == 0 else None
+                    anim_file_handle = None
+                    try:
+                        media_to_send_ref = None
+                        if anim_file_id:
+                            media_to_send_ref = anim_file_id
+                        elif anim_file_path and await asyncio.to_thread(os.path.exists, anim_file_path):
+                            anim_file_handle = await asyncio.to_thread(open, anim_file_path, 'rb')
+                            opened_files.append(anim_file_handle) # Track for closing
+                            media_to_send_ref = anim_file_handle
+                        else:
+                             logger.warning(f"Could not find GIF source for P{prod_id}: ID={anim_file_id}, Path={anim_file_path}")
+                             continue # Skip this animation
+
+                        await context.bot.send_animation(
+                            chat_id=chat_id,
+                            animation=media_to_send_ref,
+                            caption=caption_for_anim,
+                            parse_mode=None
+                        )
+                        if caption_for_anim: caption_sent_flag = True # Mark caption as sent
+                        logger.info(f"Sent animation for P{prod_id} user {user_id}.")
+                    except Exception as anim_e:
+                        logger.error(f"Error sending animation P{prod_id}: {anim_e}")
+                        # If sending the animation that *should* have had the caption fails, make sure text is sent later
+                        if caption_for_anim: caption_sent_flag = False
+                    finally:
+                        # Close the file handle if it was opened for this animation
+                        if anim_file_handle and anim_file_handle in opened_files:
+                             try: await asyncio.to_thread(anim_file_handle.close); opened_files.remove(anim_file_handle)
+                             except Exception: pass
+
+                # --- Send Text if No Media OR Caption Failed ---
+                # Send the text ONLY if the caption wasn't successfully attached to any media item
+                if not caption_sent_flag:
+                    text_to_send = combined_caption # Send the full combined caption if it failed elsewhere
+                    if not media_items_for_product: # If there was no media at all, just send original text
+                         text_to_send = item_original_text if item_original_text else f"(No media or text details found for {item_name} {item_size})"
+
+                    if text_to_send: # Avoid sending empty message
+                        await send_message_with_retry(context.bot, chat_id, text_to_send, parse_mode=None)
+                        logger.info(f"Sent text details separately for P{prod_id} user {user_id}.")
+                    else:
+                         logger.info(f"No text to send separately for P{prod_id} user {user_id} (caption likely sent with media).")
+
+
+            # --- Close any remaining opened file handles ---
+            for f in opened_files:
+                try:
+                    if not f.closed: await asyncio.to_thread(f.close)
+                except Exception as close_e: logger.warning(f"Error closing file handle '{getattr(f, 'name', 'unknown')}' during final cleanup: {close_e}")
+
+            # --- Product Deletion & Final Message ---
+            # Delete Product Records and Media Directories Async (moved down slightly)
+            conn_del = None
+            try:
+                conn_del = get_db_connection()
+                c_del = conn_del.cursor()
+                ids_tuple_list = [(pid,) for pid in processed_product_ids]
+                c_del.executemany("DELETE FROM product_media WHERE product_id = ?", ids_tuple_list)
+                delete_result = c_del.executemany("DELETE FROM products WHERE id = ?", ids_tuple_list)
+                conn_del.commit()
+                deleted_count = delete_result.rowcount # Use this if needed later
+                logger.info(f"Attempted deletion of {len(processed_product_ids)} purchased product records (Result: {deleted_count}).")
+                for prod_id in processed_product_ids:
+                     media_dir_to_delete = os.path.join(MEDIA_DIR, str(prod_id))
+                     if await asyncio.to_thread(os.path.exists, media_dir_to_delete):
+                         # Run deletion in background task
+                         asyncio.create_task(asyncio.to_thread(shutil.rmtree, media_dir_to_delete, ignore_errors=True))
+                         logger.info(f"Scheduled deletion of media dir: {media_dir_to_delete}")
+            except sqlite3.Error as e: logger.error(f"DB error deleting purchased products: {e}", exc_info=True); conn_del.rollback() if conn_del and conn_del.in_transaction else None
+            except Exception as e: logger.error(f"Unexpected error deleting purchased products: {e}", exc_info=True)
+            finally:
+                if conn_del: conn_del.close()
+
+            # Final Message to User
+            final_message_parts = ["Purchase details sent above."]
+            leave_review_button = lang_data.get("leave_review_button", "Leave a Review")
+            keyboard = [[InlineKeyboardButton(f"✍️ {leave_review_button}", callback_data="leave_review_now")]]
+            await send_message_with_retry(context.bot, chat_id, "\n\n".join(final_message_parts), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
 
         return True # Indicate success
     else: # Purchase failed at DB level
@@ -825,7 +894,7 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
         context.user_data.pop('applied_discount', None)
         if chat_id: await send_message_with_retry(context.bot, chat_id, lang_data.get("error_processing_purchase_contact_support", "❌ Error processing purchase."), parse_mode=None)
         return False
-
+# <<< END REPLACEMENT >>>
 # --- END _finalize_purchase ---
 
 
@@ -907,7 +976,9 @@ async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list
     if finalize_success:
         if chat_id: # Notify user if possible
              success_msg = lang_data.get("crypto_purchase_success", "Payment Confirmed! Your purchase details are being sent.")
-             await send_message_with_retry(context.bot, chat_id, success_msg, parse_mode=None)
+             # Don't send the success message immediately, _finalize_purchase already sends messages
+             # await send_message_with_retry(context.bot, chat_id, success_msg, parse_mode=None)
+             logger.info(f"Crypto purchase finalized for {user_id}, payment {payment_id}. _finalize_purchase handled user messages.")
     else:
         # Finalization failed even after payment confirmed. This is bad.
         logger.error(f"CRITICAL: Crypto payment {payment_id} success for user {user_id}, but _finalize_purchase failed! Items paid for but not processed in DB correctly.")

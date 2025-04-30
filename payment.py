@@ -47,20 +47,19 @@ except ImportError:
 # -----------------------------
 
 # --- Import Unreserve Helper ---
-# Assume _unreserve_basket_items is defined in user.py or utils.py
-# If it's in user.py, this import might cause circular issues,
-# it's better placed in utils.py or defined locally if needed.
-# For now, we assume it's accessible via user module based on previous fix attempt.
-# If issues arise, define it directly in this file or move to utils.py
+# Assume _unreserve_basket_items is defined elsewhere (e.g., user.py or utils.py)
 try:
-    # Try importing from user first, as per previous suggestion
     from user import _unreserve_basket_items
 except ImportError:
-    logger_unreserve_import_error = logging.getLogger(__name__)
-    logger_unreserve_import_error.error("Could not import _unreserve_basket_items helper function! Un-reserving on failure might not work.")
-    # Define a dummy function to avoid crashes, but log loudly
-    def _unreserve_basket_items(basket_snapshot: list | None):
-        logger_unreserve_import_error.critical("CRITICAL: _unreserve_basket_items function is missing! Cannot un-reserve items on payment failure.")
+    # Fallback: Try importing from utils
+    try:
+        from utils import _unreserve_basket_items
+    except ImportError:
+        logger_unreserve_import_error = logging.getLogger(__name__)
+        logger_unreserve_import_error.error("Could not import _unreserve_basket_items helper function from user.py or utils.py! Un-reserving on failure might not work.")
+        # Define a dummy function to avoid crashes, but log loudly
+        def _unreserve_basket_items(basket_snapshot: list | None):
+            logger_unreserve_import_error.critical("CRITICAL: _unreserve_basket_items function is missing! Cannot un-reserve items on payment failure.")
 # ----------------------------------
 
 logger = logging.getLogger(__name__)
@@ -155,8 +154,7 @@ async def create_nowpayments_payment(
         logger.error(f"Could not fetch minimum payment amount for {pay_currency_code} from NOWPayments API.")
         return {'error': 'min_amount_fetch_error', 'currency': pay_currency_code.upper()}
 
-    # Check if basket total itself is too low for the *chosen* currency
-    # Compare estimated crypto amount needed for the purchase vs the API minimum
+    # Check if purchase value in crypto is below the minimum required by API
     if is_purchase and estimated_crypto_amount < min_amount_api:
          logger.warning(f"Basket purchase for user {user_id} ({target_eur_amount} EUR -> {estimated_crypto_amount} {pay_currency_code}) is below the API minimum {min_amount_api} {pay_currency_code}.")
          return {
@@ -207,7 +205,6 @@ async def create_nowpayments_payment(
                  error_content = e.response.text if e.response is not None else "No response content"
                  if status_code == 401: return {'error': 'api_key_invalid'}
                  if status_code == 400 and "AMOUNT_MINIMAL_ERROR" in error_content:
-                     # This can happen even if we checked min amount, due to slight fluctuations
                      logger.warning(f"NOWPayments rejected payment for {order_id} due to amount minimal error (API check).")
                      min_amount_fallback = f"{min_amount_api:.8f}".rstrip('0').rstrip('.')
                      return {'error': 'amount_too_low_api', 'currency': pay_currency_code.upper(), 'min_amount': min_amount_fallback, 'crypto_amount': f"{invoice_crypto_amount:.8f}".rstrip('0').rstrip('.'), 'target_eur_amount': target_eur_amount}
@@ -417,12 +414,18 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         if error_code in ['basket_pay_too_low', 'amount_too_low_api', 'min_amount_fetch_error', 'estimate_failed', 'estimate_currency_not_found', 'payment_api_misconfigured']:
             logger.info(f"Invoice creation failed ({error_code}) before pending record. Un-reserving items from snapshot.")
             # Use the snapshot we stored before clearing context
-            await asyncio.to_thread(_unreserve_basket_items, snapshot_before_clear) # Call the helper using asyncio.to_thread
+            # Ensure the helper function is available and called correctly
+            try:
+                await asyncio.to_thread(_unreserve_basket_items, snapshot_before_clear)
+            except NameError:
+                 logger.critical("CRITICAL: _unreserve_basket_items function call failed due to NameError!")
+            except Exception as unreserve_e:
+                 logger.error(f"Error occurred during item un-reservation: {unreserve_e}")
         # --- End Un-reserve Fix ---
 
         error_message_to_user = failed_invoice_creation_msg # Default error
         # Handle specific errors for user message
-        if error_code == 'basket_pay_too_low': # Handle the new specific error
+        if error_code == 'basket_pay_too_low':
             error_message_to_user = error_basket_pay_too_low_msg.format(
                 basket_total=payment_result.get('basket_total', 'N/A'),
                 currency=payment_result.get('currency', selected_asset_code.upper())
@@ -634,12 +637,12 @@ async def process_successful_refill(user_id: int, amount_to_add_eur: Decimal, pa
         if conn: conn.close()
 
 
-# --- HELPER: Finalize Purchase (Attempt Caption on First Media) ---
+# --- HELPER: Finalize Purchase (Send Caption Separately) ---
 async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_used: str | None, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Shared logic to finalize a purchase after payment confirmation (balance or crypto).
-    Decrements stock, adds purchase record, attempts to send media with caption on first item,
-    falls back to separate text if needed, cleans up product/media.
+    Decrements stock, adds purchase record, sends media first, then text separately,
+    cleans up product records.
     """
     chat_id = context._chat_id or context._user_id or user_id # Try to get chat_id
     if not chat_id:
@@ -687,6 +690,7 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
             item_product_type = details['product_type']
             item_reseller_discount_percent = Decimal('0.0')
             try:
+                # Use asyncio.to_thread for sync DB call within async function
                 item_reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, item_product_type)
             except Exception as e:
                 logger.error(f"Error calling get_reseller_discount for user {user_id} type {item_product_type}: {e}")
@@ -761,16 +765,14 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 product_emoji = PRODUCT_TYPES.get(product_type, DEFAULT_PRODUCT_EMOJI)
                 item_header = f"--- Item: {product_emoji} {item_name} {item_size} ---"
 
-                # Prepare combined text caption (truncate if needed for caption)
+                # Prepare combined text caption
                 combined_caption = f"{item_header}\n\n{item_original_text}"
-                caption_for_media = combined_caption
-                if len(caption_for_media) > 1024: caption_for_media = caption_for_media[:1021] + "..."
+                if len(combined_caption) > 4090: combined_caption = combined_caption[:4090] + "..." # Adjust for send_message limit
 
                 media_items_for_product = media_details.get(prod_id, [])
-                photo_video_group_details = [] # Store dicts for details
-                animations_to_send_details = [] # Store dicts for details
+                photo_video_group_details = []
+                animations_to_send_details = []
                 opened_files = []
-                caption_sent_flag = False # Track if caption has been sent
 
                 # --- Separate Media ---
                 for media_item in media_items_for_product:
@@ -781,12 +783,13 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                         photo_video_group_details.append({'type': media_type, 'id': file_id, 'path': file_path})
                     elif media_type == 'gif':
                         animations_to_send_details.append({'type': media_type, 'id': file_id, 'path': file_path})
-                    else: logger.warning(f"Unsupported media type '{media_type}' found for P{prod_id}")
+                    else:
+                        logger.warning(f"Unsupported media type '{media_type}' found for P{prod_id}")
 
-                # --- Attempt to Send Photos/Videos Group ---
+                # --- Send Photos/Videos Group (No Caption) ---
                 if photo_video_group_details:
                     media_group_input = []
-                    files_for_this_group = [] # Track files opened specifically for this group attempt
+                    files_for_this_group = []
                     try:
                         for item in photo_video_group_details:
                             input_media = None; file_handle = None
@@ -796,38 +799,25 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                             elif item['path'] and await asyncio.to_thread(os.path.exists, item['path']):
                                 file_handle = await asyncio.to_thread(open, item['path'], 'rb')
                                 opened_files.append(file_handle)
-                                files_for_this_group.append(file_handle) # Track for group-specific cleanup
+                                files_for_this_group.append(file_handle)
                                 if item['type'] == 'photo': input_media = InputMediaPhoto(media=file_handle)
                                 elif item['type'] == 'video': input_media = InputMediaVideo(media=file_handle)
                             if input_media: media_group_input.append(input_media)
                             else: logger.warning(f"Could not prepare photo/video InputMedia P{prod_id}: {item}")
 
                         if media_group_input:
-                            # Attach caption if NO animations will follow
-                            if not animations_to_send_details:
-                                # Make sure caption has a value before assigning
-                                if caption_for_media:
-                                    media_group_input[0].caption = caption_for_media
-                                    media_group_input[0].parse_mode = None
-                                    caption_sent_flag = True
-                                else:
-                                     logger.warning(f"Caption_for_media is empty, cannot attach to group P{prod_id}")
                             await context.bot.send_media_group(chat_id, media=media_group_input, connect_timeout=20, read_timeout=20)
                             logger.info(f"Sent photo/video group ({len(media_group_input)}) for P{prod_id} user {user_id}.")
                     except Exception as group_e:
                         logger.error(f"Error sending photo/video group P{prod_id}: {group_e}")
-                        # If group send failed, caption definitely wasn't sent with it
-                        if not animations_to_send_details and caption_for_media: caption_sent_flag = False # Reset flag only if caption was supposed to be sent here
-                    finally: # Close files opened *for this group attempt*
+                    finally:
                         for f in files_for_this_group:
                              try:
                                  if not f.closed: await asyncio.to_thread(f.close); opened_files.remove(f)
                              except Exception: pass
 
-                # --- Attempt to Send Animations (GIFs) Separately ---
-                for anim_idx, item in enumerate(animations_to_send_details):
-                    # Attach caption to the FIRST animation ONLY if it wasn't sent with a previous group
-                    caption_for_this_anim = caption_for_media if not caption_sent_flag and anim_idx == 0 else None
+                # --- Send Animations (GIFs) Separately (No Caption) ---
+                for item in animations_to_send_details:
                     anim_file_handle = None
                     try:
                         media_to_send_ref = None
@@ -841,34 +831,24 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                             logger.warning(f"Could not find GIF source for P{prod_id}: ID={item['id']}, Path={item['path']}")
                             continue
 
-                        await context.bot.send_animation(
-                            chat_id=chat_id,
-                            animation=media_to_send_ref,
-                            caption=caption_for_this_anim, # Send caption if needed
-                            parse_mode=None
-                        )
-                        if caption_for_this_anim: caption_sent_flag = True # Mark caption as sent
+                        await context.bot.send_animation(chat_id=chat_id, animation=media_to_send_ref) # NO CAPTION
                         logger.info(f"Sent animation for P{prod_id} user {user_id}.")
                     except Exception as anim_e:
                         logger.error(f"Error sending animation P{prod_id}: {anim_e}")
-                        if caption_for_this_anim: caption_sent_flag = False # Mark as not sent if this specific send failed
                     finally:
                         if anim_file_handle and anim_file_handle in opened_files:
                             try: await asyncio.to_thread(anim_file_handle.close); opened_files.remove(anim_file_handle)
                             except Exception: pass
 
-                # --- Send Combined Text Separately if Caption Flag is Still False ---
-                if not caption_sent_flag:
-                    text_to_send = combined_caption # Use the full text (potentially > 1024)
-                    # Check if there was actually any text to send
-                    if not item_original_text and not item_header:
-                        text_to_send = f"(No details provided for Product ID {prod_id})" # Fallback if text is truly empty
-
-                    if text_to_send:
-                        await send_message_with_retry(context.bot, chat_id, text_to_send, parse_mode=None)
-                        logger.info(f"Sent separate text details for P{prod_id} user {user_id} (caption flag false).")
-                    else:
-                        logger.info(f"No text to send separately for P{prod_id} user {user_id} (caption flag false but text empty).")
+                # --- Always Send Combined Text Separately ---
+                if combined_caption:
+                    await send_message_with_retry(context.bot, chat_id, combined_caption, parse_mode=None)
+                    logger.info(f"Sent separate text details for P{prod_id} user {user_id}.")
+                else:
+                     # Create a fallback message if both original text and header are missing somehow
+                    fallback_text = f"(No details provided for Product ID {prod_id})"
+                    await send_message_with_retry(context.bot, chat_id, fallback_text, parse_mode=None)
+                    logger.warning(f"No combined caption text to send for P{prod_id} user {user_id}. Sent fallback.")
 
             # --- Close any remaining opened file handles ---
             for f in opened_files:
@@ -882,8 +862,7 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 conn_del = get_db_connection()
                 c_del = conn_del.cursor()
                 ids_tuple_list = [(pid,) for pid in processed_product_ids]
-                # Delete only product records, keep media files on disk
-                # c_del.executemany("DELETE FROM product_media WHERE product_id = ?", ids_tuple_list) # Keep media records for potential reuse? Or delete? Decide. Let's keep for now.
+                # Delete only product records, keep media records and files intact on disk
                 delete_result = c_del.executemany("DELETE FROM products WHERE id = ?", ids_tuple_list)
                 conn_del.commit()
                 deleted_count = delete_result.rowcount

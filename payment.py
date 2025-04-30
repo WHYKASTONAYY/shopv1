@@ -46,6 +46,22 @@ except ImportError:
         return Decimal('0.0')
 # -----------------------------
 
+# --- Import Unreserve Helper ---
+# Assume _unreserve_basket_items is defined in user.py or utils.py
+# If it's in user.py, this import might cause circular issues,
+# it's better placed in utils.py or defined locally if needed.
+# For now, we assume it's accessible via user module based on previous fix attempt.
+# If issues arise, define it directly in this file or move to utils.py
+try:
+    # Try importing from user first, as per previous suggestion
+    from user import _unreserve_basket_items
+except ImportError:
+    logger_unreserve_import_error = logging.getLogger(__name__)
+    logger_unreserve_import_error.error("Could not import _unreserve_basket_items helper function! Un-reserving on failure might not work.")
+    # Define a dummy function to avoid crashes, but log loudly
+    def _unreserve_basket_items(basket_snapshot: list | None):
+        logger_unreserve_import_error.critical("CRITICAL: _unreserve_basket_items function is missing! Cannot un-reserve items on payment failure.")
+# ----------------------------------
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +116,7 @@ async def _get_nowpayments_estimate(target_eur_amount: Decimal, pay_currency_cod
         return {'error': 'internal_estimate_error', 'details': str(e)}
 
 
-# --- Refactored NOWPayments Deposit Creation (Unchanged for reseller logic) ---
+# --- Refactored NOWPayments Deposit Creation ---
 async def create_nowpayments_payment(
     user_id: int,
     target_eur_amount: Decimal, # This should be the FINAL amount after ALL discounts
@@ -128,7 +144,7 @@ async def create_nowpayments_payment(
         logger.error(f"Failed to get estimate for {target_eur_amount} EUR to {pay_currency_code}: {estimate_result}")
         if estimate_result['error'] == 'estimate_currency_not_found':
              return {'error': 'estimate_currency_not_found', 'currency': estimate_result.get('currency', pay_currency_code.upper())}
-        return {'error': 'estimate_failed'}
+        return {'error': 'estimate_failed'} # Generic estimate failure
 
     estimated_crypto_amount = Decimal(str(estimate_result['estimated_amount']))
     logger.info(f"NOWPayments estimated {estimated_crypto_amount} {pay_currency_code} needed for {target_eur_amount} EUR")
@@ -139,19 +155,22 @@ async def create_nowpayments_payment(
         logger.error(f"Could not fetch minimum payment amount for {pay_currency_code} from NOWPayments API.")
         return {'error': 'min_amount_fetch_error', 'currency': pay_currency_code.upper()}
 
-    invoice_crypto_amount = max(estimated_crypto_amount, min_amount_api)
-    if invoice_crypto_amount > estimated_crypto_amount:
-        logger.warning(f"Estimated amount {estimated_crypto_amount} was below NOWPayments minimum {min_amount_api}. Using minimum for invoice: {invoice_crypto_amount} {pay_currency_code}")
-
     # Check if basket total itself is too low for the *chosen* currency
+    # Compare estimated crypto amount needed for the purchase vs the API minimum
     if is_purchase and estimated_crypto_amount < min_amount_api:
          logger.warning(f"Basket purchase for user {user_id} ({target_eur_amount} EUR -> {estimated_crypto_amount} {pay_currency_code}) is below the API minimum {min_amount_api} {pay_currency_code}.")
          return {
              'error': 'basket_pay_too_low',
              'currency': pay_currency_code.upper(),
-             'min_amount': f"{min_amount_api:.8f}".rstrip('0').rstrip('.'),
+             'min_amount': f"{min_amount_api:.8f}".rstrip('0').rstrip('.'), # Format min amount nicely
              'basket_total': format_currency(target_eur_amount)
          }
+
+    # Determine the amount for the invoice: Use estimate OR minimum, whichever is higher
+    invoice_crypto_amount = max(estimated_crypto_amount, min_amount_api)
+    if invoice_crypto_amount > estimated_crypto_amount:
+        logger.warning(f"Estimated amount {estimated_crypto_amount} was below NOWPayments minimum {min_amount_api}. Using minimum for invoice: {invoice_crypto_amount} {pay_currency_code}")
+
 
     # 3. Prepare API Request Data
     order_id_prefix = "PURCHASE" if is_purchase else "REFILL"
@@ -160,13 +179,13 @@ async def create_nowpayments_payment(
     order_desc = f"Basket purchase for user {user_id}" if is_purchase else f"Balance top-up for user {user_id}"
 
     payload = {
-        "price_amount": float(invoice_crypto_amount),
+        "price_amount": float(invoice_crypto_amount), # Use the potentially adjusted amount
         "price_currency": pay_currency_code.lower(),
         "pay_currency": pay_currency_code.lower(),
         "ipn_callback_url": ipn_callback_url,
         "order_id": order_id,
         "order_description": f"{order_desc} (~{target_eur_amount:.2f} EUR)",
-        "is_fixed_rate": False,
+        "is_fixed_rate": False, # Use variable rate for less chance of underpayment issues
     }
     headers = {'x-api-key': NOWPAYMENTS_API_KEY, 'Content-Type': 'application/json'}
     payment_url = f"{NOWPAYMENTS_API_URL}/v1/payment"
@@ -176,6 +195,7 @@ async def create_nowpayments_payment(
         def make_payment_request():
             try:
                 response = requests.post(payment_url, headers=headers, json=payload, timeout=20)
+                logger.debug(f"NOWPayments create payment response status: {response.status_code}, content: {response.text[:200]}")
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.Timeout:
@@ -187,7 +207,8 @@ async def create_nowpayments_payment(
                  error_content = e.response.text if e.response is not None else "No response content"
                  if status_code == 401: return {'error': 'api_key_invalid'}
                  if status_code == 400 and "AMOUNT_MINIMAL_ERROR" in error_content:
-                     logger.warning(f"NOWPayments rejected payment for {order_id} due to amount being too low (API check during payment creation).")
+                     # This can happen even if we checked min amount, due to slight fluctuations
+                     logger.warning(f"NOWPayments rejected payment for {order_id} due to amount minimal error (API check).")
                      min_amount_fallback = f"{min_amount_api:.8f}".rstrip('0').rstrip('.')
                      return {'error': 'amount_too_low_api', 'currency': pay_currency_code.upper(), 'min_amount': min_amount_fallback, 'crypto_amount': f"{invoice_crypto_amount:.8f}".rstrip('0').rstrip('.'), 'target_eur_amount': target_eur_amount}
                  return {'error': 'api_request_failed', 'details': str(e), 'status': status_code, 'content': error_content[:200]}
@@ -199,7 +220,7 @@ async def create_nowpayments_payment(
         if 'error' in payment_data:
              if payment_data['error'] == 'api_key_invalid': logger.critical("NOWPayments API Key seems invalid!")
              elif payment_data.get('internal'): logger.error("Internal error during API request (e.g., timeout).")
-             elif payment_data['error'] == 'amount_too_low_api': return payment_data
+             elif payment_data['error'] == 'amount_too_low_api': return payment_data # Return specific error
              else: logger.error(f"NOWPayments API returned error during payment creation: {payment_data}")
              return payment_data # Return other errors as well
 
@@ -209,22 +230,24 @@ async def create_nowpayments_payment(
              logger.error(f"Invalid response from NOWPayments payment API for order {order_id}: Missing keys. Response: {payment_data}")
              return {'error': 'invalid_api_response'}
 
+        # Store the *actual* crypto amount required by the invoice
         expected_crypto_amount_from_invoice = Decimal(str(payment_data['pay_amount']))
         payment_data['target_eur_amount_orig'] = float(target_eur_amount) # Store the FINAL EUR amount requested
-        payment_data['pay_amount'] = f"{expected_crypto_amount_from_invoice:.8f}".rstrip('0').rstrip('.')
+        payment_data['pay_amount'] = f"{expected_crypto_amount_from_invoice:.8f}".rstrip('0').rstrip('.') # Store formatted crypto amount
         payment_data['is_purchase'] = is_purchase # Pass flag through response for display logic
 
         # 6. Store Pending Deposit Info
         add_success = await asyncio.to_thread(
             add_pending_deposit,
             payment_data['payment_id'], user_id, payment_data['pay_currency'],
-            float(target_eur_amount), float(expected_crypto_amount_from_invoice),
+            float(target_eur_amount), float(expected_crypto_amount_from_invoice), # Store the actual invoice amount
             is_purchase=is_purchase,
             basket_snapshot=basket_snapshot, # Store the snapshot
             discount_code=discount_code      # Store general discount code used
         )
         if not add_success:
              logger.error(f"Failed to add pending deposit to DB for payment_id {payment_data['payment_id']} (user {user_id}).")
+             # Attempt to cancel invoice? NOWPayments doesn't have a standard cancel API. Manual intervention needed if DB fails.
              return {'error': 'pending_db_error'}
 
         logger.info(f"Successfully created NOWPayments {log_type} invoice {payment_data['payment_id']} for user {user_id}.")
@@ -315,7 +338,7 @@ async def handle_select_refill_crypto(update: Update, context: ContextTypes.DEFA
         await display_nowpayments_invoice(update, context, payment_result)
 
 
-# --- NEW: Callback Handler for Crypto Selection during Basket Payment ---
+# --- UPDATED: Callback Handler for Crypto Selection during Basket Payment ---
 async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Handles the user selecting crypto asset for direct basket payment."""
     query = update.callback_query
@@ -342,15 +365,12 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         await query.edit_message_text("❌ Error: Payment context lost. Please go back to your basket.",
                                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ View Basket", callback_data="view_basket")]]) ,parse_mode=None)
         context.user_data.pop('state', None)
-        # Clear potentially stale basket payment context
-        context.user_data.pop('basket_pay_snapshot', None)
-        context.user_data.pop('basket_pay_total_eur', None)
-        context.user_data.pop('basket_pay_discount_code', None)
+        context.user_data.pop('basket_pay_snapshot', None); context.user_data.pop('basket_pay_total_eur', None); context.user_data.pop('basket_pay_discount_code', None)
         return
 
     final_total_eur_decimal = Decimal(str(final_total_eur_float))
 
-    # Get language strings (same as refill for now, potentially customize later)
+    # Get language strings
     preparing_invoice_msg = lang_data.get("preparing_invoice", "⏳ Preparing your payment invoice...")
     failed_invoice_creation_msg = lang_data.get("failed_invoice_creation", "❌ Failed to create payment invoice. Please try again later or contact support.")
     error_nowpayments_api_msg = lang_data.get("error_nowpayments_api", "❌ Payment API Error: Could not create payment. Please try again later or contact support.")
@@ -361,7 +381,7 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
     error_min_amount_fetch_msg = lang_data.get("error_min_amount_fetch", "❌ Error: Could not retrieve minimum payment amount for {currency}. Please try again later or select a different currency.")
     error_estimate_failed_msg = lang_data.get("error_estimate_failed", "❌ Error: Could not estimate crypto amount. Please try again or select a different currency.")
     error_estimate_currency_not_found_msg = lang_data.get("error_estimate_currency_not_found", "❌ Error: Currency {currency} not supported for estimation. Please select a different currency.")
-    error_basket_pay_too_low_msg = lang_data.get("basket_pay_too_low", "❌ Basket total {basket_total} EUR is below the minimum required for {currency}.") # <<< Specific error message
+    error_basket_pay_too_low_msg = lang_data.get("basket_pay_too_low", "❌ Basket total {basket_total} EUR is below the minimum required for {currency}.")
     back_to_basket_button = lang_data.get("back_basket_button", "Back to Basket")
     back_button_markup = InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ {back_to_basket_button}", callback_data="view_basket")]])
 
@@ -379,6 +399,9 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         discount_code=discount_code_used
     )
 
+    # Store snapshot temporarily BEFORE clearing context, in case we need it for un-reserving
+    snapshot_before_clear = context.user_data.get('basket_pay_snapshot')
+
     # Clear context *after* attempting payment creation
     context.user_data.pop('basket_pay_snapshot', None)
     context.user_data.pop('basket_pay_total_eur', None)
@@ -389,8 +412,16 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         error_code = payment_result['error']
         logger.error(f"Failed to create NOWPayments basket payment invoice for user {user_id}: {error_code} - Details: {payment_result}")
 
+        # --- Un-reserve items if invoice creation failed early ---
+        # Check for errors that happen *before* a pending deposit record is created
+        if error_code in ['basket_pay_too_low', 'amount_too_low_api', 'min_amount_fetch_error', 'estimate_failed', 'estimate_currency_not_found', 'payment_api_misconfigured']:
+            logger.info(f"Invoice creation failed ({error_code}) before pending record. Un-reserving items from snapshot.")
+            # Use the snapshot we stored before clearing context
+            await asyncio.to_thread(_unreserve_basket_items, snapshot_before_clear) # Call the helper using asyncio.to_thread
+        # --- End Un-reserve Fix ---
+
         error_message_to_user = failed_invoice_creation_msg # Default error
-        # Handle specific errors
+        # Handle specific errors for user message
         if error_code == 'basket_pay_too_low': # Handle the new specific error
             error_message_to_user = error_basket_pay_too_low_msg.format(
                 basket_total=payment_result.get('basket_total', 'N/A'),
@@ -402,7 +433,7 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         elif error_code == 'api_key_invalid': error_message_to_user = error_api_key_msg
         elif error_code == 'invalid_api_response': error_message_to_user = error_invalid_response_msg
         elif error_code == 'pending_db_error': error_message_to_user = error_pending_db_msg
-        elif error_code == 'amount_too_low_api': # Should ideally not happen due to pre-check, but handle anyway
+        elif error_code == 'amount_too_low_api':
              min_amount_val = payment_result.get('min_amount', 'N/A'); crypto_amount_val = payment_result.get('crypto_amount', 'N/A')
              target_eur_val = payment_result.get('target_eur_amount', final_total_eur_decimal)
              error_message_to_user = error_amount_too_low_api_msg.format(target_eur_amount=format_currency(target_eur_val), currency=payment_result.get('currency', selected_asset_code.upper()), crypto_amount=crypto_amount_val, min_amount=min_amount_val)
@@ -412,9 +443,7 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         try: await query.edit_message_text(error_message_to_user, reply_markup=back_button_markup, parse_mode=None)
         except Exception as edit_e: logger.error(f"Failed to edit message with basket payment creation error: {edit_e}"); await send_message_with_retry(context.bot, chat_id, error_message_to_user, reply_markup=back_button_markup, parse_mode=None)
 
-        # Since payment failed, the items are still reserved in the user's main basket.
-        # Send them back to the basket view.
-        await user.handle_view_basket(update, context)
+        # The user needs to click the "Back to Basket" button.
 
     else:
         logger.info(f"NOWPayments basket payment invoice created successfully for user {user_id}. Payment ID: {payment_result.get('payment_id')}")
@@ -422,6 +451,7 @@ async def handle_select_basket_crypto(update: Update, context: ContextTypes.DEFA
         await display_nowpayments_invoice(update, context, payment_result)
         # Important: DO NOT clear the user's actual basket here.
         # It only gets cleared after the webhook confirms payment.
+
 
 # --- Display NOWPayments Invoice ---
 async def display_nowpayments_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, payment_data: dict):
@@ -521,7 +551,7 @@ Please send the following amount:
          except Exception: pass
 
 
-# --- Process Successful Refill (Unchanged) ---
+# --- Process Successful Refill ---
 async def process_successful_refill(user_id: int, amount_to_add_eur: Decimal, payment_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     bot = context.bot
     user_lang = 'en'
@@ -604,13 +634,12 @@ async def process_successful_refill(user_id: int, amount_to_add_eur: Decimal, pa
         if conn: conn.close()
 
 
-# --- HELPER: Finalize Purchase (Shared Logic - Modified for Reseller Price and Media Handling) ---
-# <<< START REPLACEMENT >>>
+# --- HELPER: Finalize Purchase (Attempt Caption on First Media) ---
 async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_used: str | None, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Shared logic to finalize a purchase after payment confirmation (balance or crypto).
-    Decrements stock, adds purchase record (with potentially discounted price),
-    sends details, cleans up product/media.
+    Decrements stock, adds purchase record, attempts to send media with caption on first item,
+    falls back to separate text if needed, cleans up product/media.
     """
     chat_id = context._chat_id or context._user_id or user_id # Try to get chat_id
     if not chat_id:
@@ -625,20 +654,19 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
     purchases_to_insert = []
     final_pickup_details = defaultdict(list)
     db_update_successful = False
-    total_price_paid_decimal = Decimal('0.0') # Track total actually paid after discounts
+    total_price_paid_decimal = Decimal('0.0')
 
+    # --- Database Operations (Reservation Decrement, Purchase Record) ---
     try:
         conn = get_db_connection()
         c = conn.cursor()
         c.execute("BEGIN EXCLUSIVE")
 
-        # Get product IDs from snapshot
         product_ids_in_snapshot = list(set(item['product_id'] for item in basket_snapshot))
         if not product_ids_in_snapshot:
             logger.warning(f"Empty snapshot IDs user {user_id} finalization."); conn.rollback(); return False
 
         placeholders = ','.join('?' * len(product_ids_in_snapshot))
-        # Fetch details needed for processing and pickup info (including original price)
         c.execute(f"SELECT id, name, product_type, size, price, city, district, original_text FROM products WHERE id IN ({placeholders})", product_ids_in_snapshot)
         product_db_details = {row['id']: dict(row) for row in c.fetchall()}
         purchase_time_iso = datetime.now(timezone.utc).isoformat()
@@ -650,32 +678,24 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 logger.error(f"CRITICAL: Reserved product {product_id} missing from DB during finalization user {user_id}. Skipping item.")
                 continue
 
-            # Decrement available count
             avail_update = c.execute("UPDATE products SET available = available - 1 WHERE id = ? AND available > 0", (product_id,))
             if avail_update.rowcount == 0:
                 logger.error(f"CRITICAL: Failed available decrement for reserved product P{product_id} user {user_id}. Race condition or logic error?")
                 continue
 
-            # --- Calculate Price Paid (Original - Reseller Discount) ---
             item_original_price_decimal = Decimal(str(details['price']))
             item_product_type = details['product_type']
-            item_reseller_discount_percent = Decimal('0.0') # Default to 0
-            # Use try-except for safety, although the original log shows it failed before this point
+            item_reseller_discount_percent = Decimal('0.0')
             try:
-                # Attempt to get reseller discount (run sync function in thread)
                 item_reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, item_product_type)
             except Exception as e:
                 logger.error(f"Error calling get_reseller_discount for user {user_id} type {item_product_type}: {e}")
-                # Continue with 0% discount if there's an error
 
             item_reseller_discount_amount = (item_original_price_decimal * item_reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
             item_price_paid_decimal = item_original_price_decimal - item_reseller_discount_amount
-            # --- End Calculation ---
+            total_price_paid_decimal += item_price_paid_decimal
+            item_price_paid_float = float(item_price_paid_decimal)
 
-            total_price_paid_decimal += item_price_paid_decimal # Sum ACTUAL price paid
-            item_price_paid_float = float(item_price_paid_decimal) # Convert to float for DB insert
-
-            # <<< Use item_price_paid_float for purchase record >>>
             purchases_to_insert.append((
                 user_id, product_id, details['name'], item_product_type, details['size'],
                 item_price_paid_float, details['city'], details['district'], purchase_time_iso
@@ -689,16 +709,10 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
             if chat_id: await send_message_with_retry(context.bot, chat_id, lang_data.get("error_processing_purchase_contact_support", "❌ Error processing purchase."), parse_mode=None)
             return False
 
-        # Record Purchases & Update User Stats
         c.executemany("INSERT INTO purchases (user_id, product_id, product_name, product_type, product_size, price_paid, city, district, purchase_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", purchases_to_insert)
         c.execute("UPDATE users SET total_purchases = total_purchases + ? WHERE user_id = ?", (len(purchases_to_insert), user_id))
-
-        # Increment general discount code usage if applicable
         if discount_code_used:
-            logger.info(f"Incrementing usage count for general discount code '{discount_code_used}' used by {user_id}.")
             c.execute("UPDATE discount_codes SET uses_count = uses_count + 1 WHERE code = ?", (discount_code_used,))
-
-        # Clear user's basket in DB
         c.execute("UPDATE users SET basket = '' WHERE user_id = ?", (user_id,))
         conn.commit()
         db_update_successful = True
@@ -715,7 +729,6 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
 
     # --- Post-Transaction Cleanup & Message Sending (If DB success) ---
     if db_update_successful:
-        # Clear context basket and discount
         context.user_data['basket'] = []
         context.user_data.pop('applied_discount', None)
 
@@ -734,7 +747,7 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 if conn_media: conn_media.close()
 
         # Send Pickup Details
-        if chat_id: # Only attempt if we have a chat_id
+        if chat_id:
             success_title = lang_data.get("purchase_success", "🎉 Purchase Complete! Pickup details below:")
             await send_message_with_retry(context.bot, chat_id, success_title, parse_mode=None)
 
@@ -743,150 +756,147 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 if not item_details_list: continue
                 item_details = item_details_list[0]
                 item_name, item_size = item_details['name'], item_details['size']
-                item_original_text = item_details['text'] or "(No specific pickup details provided)" # Renamed for clarity
+                item_original_text = item_details['text'] or "(No specific pickup details provided)"
                 product_type = product_db_details.get(prod_id, {}).get('product_type', 'Product')
                 product_emoji = PRODUCT_TYPES.get(product_type, DEFAULT_PRODUCT_EMOJI)
                 item_header = f"--- Item: {product_emoji} {item_name} {item_size} ---"
 
-                # Prepare caption
+                # Prepare combined text caption (truncate if needed for caption)
                 combined_caption = f"{item_header}\n\n{item_original_text}"
-                if len(combined_caption) > 1024: combined_caption = combined_caption[:1021] + "..."
+                caption_for_media = combined_caption
+                if len(caption_for_media) > 1024: caption_for_media = caption_for_media[:1021] + "..."
 
-                media_to_send_separately = [] # Store tuples (type, file_id, file_path)
-                photo_video_group = []
-                opened_files = []
                 media_items_for_product = media_details.get(prod_id, [])
+                photo_video_group_details = [] # Store dicts for details
+                animations_to_send_details = [] # Store dicts for details
+                opened_files = []
                 caption_sent_flag = False # Track if caption has been sent
 
-                # --- Separate Media Types ---
+                # --- Separate Media ---
                 for media_item in media_items_for_product:
                     media_type = media_item.get('media_type')
                     file_id = media_item.get('telegram_file_id')
                     file_path = media_item.get('file_path')
-
                     if media_type in ['photo', 'video']:
-                        # Prepare InputMedia for grouping
-                        input_media = None; file_handle = None
-                        try:
-                            if file_id:
-                                if media_type == 'photo': input_media = InputMediaPhoto(media=file_id)
-                                elif media_type == 'video': input_media = InputMediaVideo(media=file_id)
-                            elif file_path and await asyncio.to_thread(os.path.exists, file_path):
-                                file_handle = await asyncio.to_thread(open, file_path, 'rb')
-                                opened_files.append(file_handle)
-                                if media_type == 'photo': input_media = InputMediaPhoto(media=file_handle)
-                                elif media_type == 'video': input_media = InputMediaVideo(media=file_handle)
-                            if input_media: photo_video_group.append(input_media)
-                            else: logger.warning(f"Could not prepare photo/video InputMedia P{prod_id}: {media_item}")
-                        except Exception as prep_e:
-                             logger.error(f"Error preparing photo/video InputMedia P{prod_id}: {prep_e}", exc_info=True)
-                             if file_handle and file_handle in opened_files:
-                                try: await asyncio.to_thread(file_handle.close); opened_files.remove(file_handle)
-                                except Exception: pass
+                        photo_video_group_details.append({'type': media_type, 'id': file_id, 'path': file_path})
                     elif media_type == 'gif':
-                        # Store info for sending separately
-                        media_to_send_separately.append(('gif', file_id, file_path))
-                    else:
-                        logger.warning(f"Unsupported media type '{media_type}' found for P{prod_id}")
+                        animations_to_send_details.append({'type': media_type, 'id': file_id, 'path': file_path})
+                    else: logger.warning(f"Unsupported media type '{media_type}' found for P{prod_id}")
 
-                # --- Send Photos/Videos Group ---
-                try:
-                    if photo_video_group:
-                        # Attach caption to the first item IF no separate media will be sent after it
-                        if not media_to_send_separately:
-                            photo_video_group[0].caption = combined_caption
-                            photo_video_group[0].parse_mode = None # Ensure parse mode is None
-                            caption_sent_flag = True
+                # --- Attempt to Send Photos/Videos Group ---
+                if photo_video_group_details:
+                    media_group_input = []
+                    files_for_this_group = [] # Track files opened specifically for this group attempt
+                    try:
+                        for item in photo_video_group_details:
+                            input_media = None; file_handle = None
+                            if item['id']:
+                                if item['type'] == 'photo': input_media = InputMediaPhoto(media=item['id'])
+                                elif item['type'] == 'video': input_media = InputMediaVideo(media=item['id'])
+                            elif item['path'] and await asyncio.to_thread(os.path.exists, item['path']):
+                                file_handle = await asyncio.to_thread(open, item['path'], 'rb')
+                                opened_files.append(file_handle)
+                                files_for_this_group.append(file_handle) # Track for group-specific cleanup
+                                if item['type'] == 'photo': input_media = InputMediaPhoto(media=file_handle)
+                                elif item['type'] == 'video': input_media = InputMediaVideo(media=file_handle)
+                            if input_media: media_group_input.append(input_media)
+                            else: logger.warning(f"Could not prepare photo/video InputMedia P{prod_id}: {item}")
 
-                        await context.bot.send_media_group(chat_id, media=photo_video_group, connect_timeout=20, read_timeout=20)
-                        logger.info(f"Sent photo/video group ({len(photo_video_group)}) for P{prod_id} user {user_id}.")
-                except Exception as group_e:
-                    logger.error(f"Error sending photo/video group P{prod_id}: {group_e}")
-                    caption_sent_flag = False # Ensure caption is sent separately if group fails
+                        if media_group_input:
+                            # Attach caption if NO animations will follow
+                            if not animations_to_send_details:
+                                # Make sure caption has a value before assigning
+                                if caption_for_media:
+                                    media_group_input[0].caption = caption_for_media
+                                    media_group_input[0].parse_mode = None
+                                    caption_sent_flag = True
+                                else:
+                                     logger.warning(f"Caption_for_media is empty, cannot attach to group P{prod_id}")
+                            await context.bot.send_media_group(chat_id, media=media_group_input, connect_timeout=20, read_timeout=20)
+                            logger.info(f"Sent photo/video group ({len(media_group_input)}) for P{prod_id} user {user_id}.")
+                    except Exception as group_e:
+                        logger.error(f"Error sending photo/video group P{prod_id}: {group_e}")
+                        # If group send failed, caption definitely wasn't sent with it
+                        if not animations_to_send_details and caption_for_media: caption_sent_flag = False # Reset flag only if caption was supposed to be sent here
+                    finally: # Close files opened *for this group attempt*
+                        for f in files_for_this_group:
+                             try:
+                                 if not f.closed: await asyncio.to_thread(f.close); opened_files.remove(f)
+                             except Exception: pass
 
-                # --- Send Animations (GIFs) Separately ---
-                for anim_idx, (anim_type, anim_file_id, anim_file_path) in enumerate(media_to_send_separately):
-                    # Send caption with the *first* animation if it wasn't sent with the photo/video group
-                    caption_for_anim = combined_caption if not caption_sent_flag and anim_idx == 0 else None
+                # --- Attempt to Send Animations (GIFs) Separately ---
+                for anim_idx, item in enumerate(animations_to_send_details):
+                    # Attach caption to the FIRST animation ONLY if it wasn't sent with a previous group
+                    caption_for_this_anim = caption_for_media if not caption_sent_flag and anim_idx == 0 else None
                     anim_file_handle = None
                     try:
                         media_to_send_ref = None
-                        if anim_file_id:
-                            media_to_send_ref = anim_file_id
-                        elif anim_file_path and await asyncio.to_thread(os.path.exists, anim_file_path):
-                            anim_file_handle = await asyncio.to_thread(open, anim_file_path, 'rb')
-                            opened_files.append(anim_file_handle) # Track for closing
+                        if item['id']:
+                            media_to_send_ref = item['id']
+                        elif item['path'] and await asyncio.to_thread(os.path.exists, item['path']):
+                            anim_file_handle = await asyncio.to_thread(open, item['path'], 'rb')
+                            opened_files.append(anim_file_handle)
                             media_to_send_ref = anim_file_handle
                         else:
-                             logger.warning(f"Could not find GIF source for P{prod_id}: ID={anim_file_id}, Path={anim_file_path}")
-                             continue # Skip this animation
+                            logger.warning(f"Could not find GIF source for P{prod_id}: ID={item['id']}, Path={item['path']}")
+                            continue
 
                         await context.bot.send_animation(
                             chat_id=chat_id,
                             animation=media_to_send_ref,
-                            caption=caption_for_anim,
+                            caption=caption_for_this_anim, # Send caption if needed
                             parse_mode=None
                         )
-                        if caption_for_anim: caption_sent_flag = True # Mark caption as sent
+                        if caption_for_this_anim: caption_sent_flag = True # Mark caption as sent
                         logger.info(f"Sent animation for P{prod_id} user {user_id}.")
                     except Exception as anim_e:
                         logger.error(f"Error sending animation P{prod_id}: {anim_e}")
-                        # If sending the animation that *should* have had the caption fails, make sure text is sent later
-                        if caption_for_anim: caption_sent_flag = False
+                        if caption_for_this_anim: caption_sent_flag = False # Mark as not sent if this specific send failed
                     finally:
-                        # Close the file handle if it was opened for this animation
                         if anim_file_handle and anim_file_handle in opened_files:
-                             try: await asyncio.to_thread(anim_file_handle.close); opened_files.remove(anim_file_handle)
-                             except Exception: pass
+                            try: await asyncio.to_thread(anim_file_handle.close); opened_files.remove(anim_file_handle)
+                            except Exception: pass
 
-                # --- Send Text if No Media OR Caption Failed ---
-                # Send the text ONLY if the caption wasn't successfully attached to any media item
+                # --- Send Combined Text Separately if Caption Flag is Still False ---
                 if not caption_sent_flag:
-                    text_to_send = combined_caption # Send the full combined caption if it failed elsewhere
-                    if not media_items_for_product: # If there was no media at all, just send original text
-                         text_to_send = item_original_text if item_original_text else f"(No media or text details found for {item_name} {item_size})"
+                    text_to_send = combined_caption # Use the full text (potentially > 1024)
+                    # Check if there was actually any text to send
+                    if not item_original_text and not item_header:
+                        text_to_send = f"(No details provided for Product ID {prod_id})" # Fallback if text is truly empty
 
-                    if text_to_send: # Avoid sending empty message
+                    if text_to_send:
                         await send_message_with_retry(context.bot, chat_id, text_to_send, parse_mode=None)
-                        logger.info(f"Sent text details separately for P{prod_id} user {user_id}.")
+                        logger.info(f"Sent separate text details for P{prod_id} user {user_id} (caption flag false).")
                     else:
-                         logger.info(f"No text to send separately for P{prod_id} user {user_id} (caption likely sent with media).")
-
+                        logger.info(f"No text to send separately for P{prod_id} user {user_id} (caption flag false but text empty).")
 
             # --- Close any remaining opened file handles ---
             for f in opened_files:
                 try:
                     if not f.closed: await asyncio.to_thread(f.close)
-                except Exception as close_e: logger.warning(f"Error closing file handle '{getattr(f, 'name', 'unknown')}' during final cleanup: {close_e}")
+                except Exception as close_e: logger.warning(f"Error closing file handle during final cleanup: {close_e}")
 
-            # --- Product Deletion & Final Message ---
-            # Delete Product Records and Media Directories Async (moved down slightly)
+            # --- Product Record Deletion ---
             conn_del = None
             try:
                 conn_del = get_db_connection()
                 c_del = conn_del.cursor()
                 ids_tuple_list = [(pid,) for pid in processed_product_ids]
-                c_del.executemany("DELETE FROM product_media WHERE product_id = ?", ids_tuple_list)
+                # Delete only product records, keep media files on disk
+                # c_del.executemany("DELETE FROM product_media WHERE product_id = ?", ids_tuple_list) # Keep media records for potential reuse? Or delete? Decide. Let's keep for now.
                 delete_result = c_del.executemany("DELETE FROM products WHERE id = ?", ids_tuple_list)
                 conn_del.commit()
-                deleted_count = delete_result.rowcount # Use this if needed later
-                logger.info(f"Attempted deletion of {len(processed_product_ids)} purchased product records (Result: {deleted_count}).")
-                for prod_id in processed_product_ids:
-                     media_dir_to_delete = os.path.join(MEDIA_DIR, str(prod_id))
-                     if await asyncio.to_thread(os.path.exists, media_dir_to_delete):
-                         # Run deletion in background task
-                         asyncio.create_task(asyncio.to_thread(shutil.rmtree, media_dir_to_delete, ignore_errors=True))
-                         logger.info(f"Scheduled deletion of media dir: {media_dir_to_delete}")
+                deleted_count = delete_result.rowcount
+                logger.info(f"Deleted {deleted_count} purchased product records for user {user_id}.")
             except sqlite3.Error as e: logger.error(f"DB error deleting purchased products: {e}", exc_info=True); conn_del.rollback() if conn_del and conn_del.in_transaction else None
             except Exception as e: logger.error(f"Unexpected error deleting purchased products: {e}", exc_info=True)
             finally:
                 if conn_del: conn_del.close()
 
-            # Final Message to User
-            final_message_parts = ["Purchase details sent above."]
+            # --- Final Message to User ---
             leave_review_button = lang_data.get("leave_review_button", "Leave a Review")
             keyboard = [[InlineKeyboardButton(f"✍️ {leave_review_button}", callback_data="leave_review_now")]]
-            await send_message_with_retry(context.bot, chat_id, "\n\n".join(final_message_parts), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+            await send_message_with_retry(context.bot, chat_id, "Thank you for your purchase!", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
 
         return True # Indicate success
     else: # Purchase failed at DB level
@@ -894,8 +904,6 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
         context.user_data.pop('applied_discount', None)
         if chat_id: await send_message_with_retry(context.bot, chat_id, lang_data.get("error_processing_purchase_contact_support", "❌ Error processing purchase."), parse_mode=None)
         return False
-# <<< END REPLACEMENT >>>
-# --- END _finalize_purchase ---
 
 
 # --- Process Purchase with Balance (Uses Helper) ---
@@ -951,7 +959,7 @@ async def process_purchase_with_balance(user_id: int, amount_to_deduct: Decimal,
         if chat_id: await send_message_with_retry(context.bot, chat_id, error_processing_purchase_contact_support, parse_mode=None)
         return False
 
-# --- NEW: Process Successful Crypto Purchase (Uses Helper) ---
+# --- Process Successful Crypto Purchase (Uses Helper) ---
 async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list, discount_code_used: str | None, payment_id: str, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Handles finalizing a purchase paid via crypto webhook."""
     chat_id = context._chat_id or context._user_id or user_id # Try to get chat_id
@@ -962,7 +970,6 @@ async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list
 
     if not basket_snapshot:
         logger.error(f"CRITICAL: Successful crypto payment {payment_id} for user {user_id} received, but basket snapshot was empty/missing in pending record.")
-        # Cannot finalize purchase without knowing what was bought. Manual intervention likely needed.
         if ADMIN_ID and chat_id:
             try:
                 await send_message_with_retry(context.bot, ADMIN_ID, f"⚠️ Critical Issue: Crypto payment {payment_id} success for user {user_id}, but basket data missing! Manual check needed.", parse_mode=None)
@@ -974,11 +981,8 @@ async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list
     finalize_success = await _finalize_purchase(user_id, basket_snapshot, discount_code_used, context)
 
     if finalize_success:
-        if chat_id: # Notify user if possible
-             success_msg = lang_data.get("crypto_purchase_success", "Payment Confirmed! Your purchase details are being sent.")
-             # Don't send the success message immediately, _finalize_purchase already sends messages
-             # await send_message_with_retry(context.bot, chat_id, success_msg, parse_mode=None)
-             logger.info(f"Crypto purchase finalized for {user_id}, payment {payment_id}. _finalize_purchase handled user messages.")
+        # _finalize_purchase now handles the user-facing confirmation messages
+        logger.info(f"Crypto purchase finalized for {user_id}, payment {payment_id}. _finalize_purchase handled user messages.")
     else:
         # Finalization failed even after payment confirmed. This is bad.
         logger.error(f"CRITICAL: Crypto payment {payment_id} success for user {user_id}, but _finalize_purchase failed! Items paid for but not processed in DB correctly.")
@@ -989,7 +993,6 @@ async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list
                  logger.error(f"Failed to notify admin about critical finalization failure: {admin_notify_e}")
         if chat_id:
             await send_message_with_retry(context.bot, chat_id, lang_data.get("error_processing_purchase_contact_support", "❌ Error processing purchase. Contact support."), parse_mode=None)
-
 
     return finalize_success
 

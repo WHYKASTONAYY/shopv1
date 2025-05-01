@@ -1214,96 +1214,141 @@ async def handle_user_discount_code_message(update: Update, context: ContextType
 # --- END handle_user_discount_code_message ---
 
 
-# --- Remove From Basket ---
+# --- Remove From Basket (MODIFIED FOR CONSISTENCY) ---
 async def handle_remove_from_basket(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     query = update.callback_query
     user_id = query.from_user.id
     lang, lang_data = _get_lang_data(context)
 
-    if not params: logger.warning(f"handle_remove_from_basket no product_id user {user_id}."); await query.answer("Error: Product ID missing.", show_alert=True); return
-    try: product_id_to_remove = int(params[0])
-    except ValueError: logger.warning(f"Invalid product_id format user {user_id}: {params[0]}"); await query.answer("Error: Invalid product data.", show_alert=True); return
+    if not params:
+        logger.warning(f"handle_remove_from_basket no product_id user {user_id}.")
+        await query.answer("Error: Product ID missing.", show_alert=True)
+        return
+
+    try:
+        product_id_to_remove = int(params[0])
+    except ValueError:
+        logger.warning(f"Invalid product_id format user {user_id}: {params[0]}")
+        await query.answer("Error: Invalid product data.", show_alert=True)
+        return
 
     logger.info(f"Attempting remove product {product_id_to_remove} user {user_id}.")
-    item_removed_from_context = False; item_to_remove_str = None; conn = None
-    current_basket_context = context.user_data.get("basket", []); new_basket_context = []
-    found_item_index = -1
 
-    # Find item in context basket
+    current_basket_context = context.user_data.get("basket", [])
+    found_item_index = -1
+    item_timestamp = None
+
+    # 1. Find the item in the current context first
     for index, item in enumerate(current_basket_context):
         if item.get('product_id') == product_id_to_remove:
             found_item_index = index
-            try: timestamp_float = float(item['timestamp']); item_to_remove_str = f"{item['product_id']}:{timestamp_float}"
-            except (ValueError, TypeError, KeyError) as e: logger.error(f"Invalid format in context item {item}: {e}"); item_to_remove_str = None
+            item_timestamp = item.get('timestamp') # Get the timestamp from context
             break
 
-    if found_item_index != -1:
-        item_removed_from_context = True
-        new_basket_context = current_basket_context[:found_item_index] + current_basket_context[found_item_index+1:]
-        logger.debug(f"Found item {product_id_to_remove} in context user {user_id}. DB String: {item_to_remove_str}")
-    else: logger.warning(f"Product {product_id_to_remove} not in user_data basket user {user_id}."); new_basket_context = list(current_basket_context) # Keep basket as is if not found
+    if found_item_index == -1:
+        logger.warning(f"Product {product_id_to_remove} not in user_data basket context user {user_id}. Refreshing view.")
+        await query.answer("Item not found in your current basket.", show_alert=False)
+        # Refresh basket view to show the current state
+        await handle_view_basket(update, context)
+        return
 
-    # Update DB (decrement reservation, update user basket string)
+    # Construct the string needed for DB removal *if* timestamp is valid
+    item_to_remove_db_str = None
+    if item_timestamp is not None:
+        try:
+            # Ensure timestamp is float for consistent string formatting
+            item_to_remove_db_str = f"{product_id_to_remove}:{float(item_timestamp)}"
+            logger.debug(f"Constructed DB removal string: {item_to_remove_db_str}")
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid timestamp format in context item for P{product_id_to_remove} user {user_id}: {item_timestamp}, Error: {e}")
+            # Proceed without DB string removal if timestamp is bad, but still try reservation decrement
+
+    # 2. Attempt Database Operations
+    conn = None
+    db_update_successful = False
     try:
         conn = get_db_connection()
-        c = conn.cursor(); c.execute("BEGIN")
-        # Only decrement reservation if item was actually found in context
-        if item_removed_from_context:
-             update_result = c.execute("UPDATE products SET reserved = MAX(0, reserved - 1) WHERE id = ?", (product_id_to_remove,))
-             if update_result.rowcount > 0: logger.debug(f"Decremented reservation P{product_id_to_remove}.")
-             else: logger.warning(f"Could not find P{product_id_to_remove} to decrement reservation (maybe already cleared?).")
-        # Update user's DB basket string
-        c.execute("SELECT basket FROM users WHERE user_id = ?", (user_id,))
-        db_basket_result = c.fetchone(); db_basket_str = db_basket_result['basket'] if db_basket_result else ''
-        if db_basket_str and item_to_remove_str: # Only modify DB string if we have the exact item:timestamp
-            items_list = db_basket_str.split(',')
-            if item_to_remove_str in items_list:
-                items_list.remove(item_to_remove_str); new_db_basket_str = ','.join(items_list)
-                c.execute("UPDATE users SET basket = ? WHERE user_id = ?", (new_db_basket_str, user_id)); logger.debug(f"Updated DB basket user {user_id} to: {new_db_basket_str}")
-            else: logger.warning(f"Item string '{item_to_remove_str}' not found in DB basket '{db_basket_str}' user {user_id}.")
-        elif item_removed_from_context and not item_to_remove_str: logger.warning(f"Could not construct item string for DB removal P{product_id_to_remove}.")
-        elif not item_removed_from_context: logger.debug(f"Item {product_id_to_remove} not in context, DB basket not modified.")
+        c = conn.cursor()
+        c.execute("BEGIN")
+
+        # Decrement reservation count
+        update_result = c.execute("UPDATE products SET reserved = MAX(0, reserved - 1) WHERE id = ?", (product_id_to_remove,))
+        if update_result.rowcount == 0:
+            logger.warning(f"No rows updated decrementing reservation for P{product_id_to_remove} user {user_id}. Product might not exist or already has 0 reserved.")
+        else:
+             logger.info(f"Successfully decremented reservation count for P{product_id_to_remove} user {user_id}.")
+
+
+        # Update user's DB basket string if possible
+        if item_to_remove_db_str:
+            c.execute("SELECT basket FROM users WHERE user_id = ?", (user_id,))
+            db_basket_result = c.fetchone()
+            db_basket_str = db_basket_result['basket'] if db_basket_result else ''
+            if db_basket_str:
+                items_list = db_basket_str.split(',')
+                if item_to_remove_db_str in items_list:
+                    items_list.remove(item_to_remove_db_str)
+                    new_db_basket_str = ','.join(items_list)
+                    c.execute("UPDATE users SET basket = ? WHERE user_id = ?", (new_db_basket_str, user_id))
+                    logger.info(f"Successfully updated DB basket string for user {user_id}.")
+                else:
+                    logger.warning(f"Item string '{item_to_remove_db_str}' not found in DB basket '{db_basket_str}' user {user_id}. Basket string not updated.")
+            else:
+                 logger.warning(f"User {user_id} has empty DB basket string. Cannot remove item string.")
+        else:
+            logger.warning(f"Could not construct valid DB item string for P{product_id_to_remove} user {user_id}. DB basket string not modified.")
+
         conn.commit()
-        logger.info(f"DB ops complete remove P{product_id_to_remove} user {user_id}.")
-
-        # Update context basket
-        context.user_data['basket'] = new_basket_context
-
-        # --- Re-validate General Discount after removal ---
-        if not context.user_data['basket']:
-            context.user_data.pop('applied_discount', None) # Clear discount if basket empty
-        elif context.user_data.get('applied_discount'):
-            applied_discount_info = context.user_data['applied_discount']
-            # Recalculate total after reseller discounts
-            total_after_reseller_decimal = Decimal('0.0')
-            for item in context.user_data['basket']:
-                original_price = item.get('price', Decimal('0.0'))
-                product_type = item.get('product_type', '')
-                reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, product_type)
-                item_reseller_discount = (original_price * reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-                total_after_reseller_decimal += (original_price - item_reseller_discount)
-
-            # Validate against new reseller-adjusted total
-            code_valid, validation_message, _ = validate_discount_code(applied_discount_info['code'], float(total_after_reseller_decimal))
-            if not code_valid:
-                reason_removed = lang_data.get("discount_removed_invalid_basket", "Discount removed (basket changed).")
-                logger.info(f"Removing invalid general discount '{applied_discount_info['code']}' for user {user_id} after item removal.")
-                context.user_data.pop('applied_discount', None);
-                await query.answer(reason_removed, show_alert=False) # Notify user why it was removed
-        # --- End Re-validation ---
+        db_update_successful = True # Mark success only after commit
 
     except sqlite3.Error as e:
+        logger.error(f"DB error removing item {product_id_to_remove} user {user_id}: {e}", exc_info=True)
         if conn and conn.in_transaction: conn.rollback()
-        logger.error(f"DB error removing item {product_id_to_remove} user {user_id}: {e}", exc_info=True); await query.edit_message_text("❌ Error: Failed to remove item (DB).", parse_mode=None); return
+        await query.answer("Error: Failed to update database.", show_alert=True)
+        # DO NOT update context if DB fails
     except Exception as e:
+        logger.error(f"Unexpected error removing item {product_id_to_remove} user {user_id}: {e}", exc_info=True)
         if conn and conn.in_transaction: conn.rollback()
-        logger.error(f"Unexpected error removing item {product_id_to_remove} user {user_id}: {e}", exc_info=True); await query.edit_message_text("❌ Error: Unexpected issue removing item.", parse_mode=None); return
+        await query.answer("Error: Unexpected issue removing item.", show_alert=True)
+        # DO NOT update context if DB fails
     finally:
         if conn: conn.close()
 
-    # Refresh basket view
-    await handle_view_basket(update, context)
+    # 3. Update Context and Discount *only if* DB was successful
+    if db_update_successful:
+        logger.info(f"DB update successful for P{product_id_to_remove} user {user_id}. Updating context.")
+        new_basket_context = current_basket_context[:found_item_index] + current_basket_context[found_item_index+1:]
+        context.user_data['basket'] = new_basket_context
 
+        # Re-validate General Discount after removal
+        if not context.user_data['basket']:
+            context.user_data.pop('applied_discount', None) # Clear discount if basket empty
+            logger.info(f"Basket empty after removal for user {user_id}, cleared applied discount.")
+        elif context.user_data.get('applied_discount'):
+            applied_discount_info = context.user_data['applied_discount']
+            # Recalculate total after reseller discounts (needed for correct base validation)
+            total_after_reseller_decimal = Decimal('0.0')
+            try:
+                 for item in context.user_data['basket']:
+                     original_price = item.get('price', Decimal('0.0'))
+                     product_type = item.get('product_type', '')
+                     # Use await asyncio.to_thread if get_reseller_discount needs DB access and is sync
+                     reseller_discount_percent = await asyncio.to_thread(get_reseller_discount, user_id, product_type)
+                     item_reseller_discount = (original_price * reseller_discount_percent / Decimal('100')).quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+                     total_after_reseller_decimal += (original_price - item_reseller_discount)
+
+                 # Validate against new reseller-adjusted total
+                 code_valid, validation_message, _ = validate_discount_code(applied_discount_info['code'], float(total_after_reseller_decimal))
+                 if not code_valid:
+                     reason_removed = lang_data.get("discount_removed_invalid_basket", "Discount removed (basket changed).")
+                     logger.info(f"Removing invalid general discount '{applied_discount_info['code']}' for user {user_id} after item removal. Reason: {validation_message}")
+                     context.user_data.pop('applied_discount', None);
+                     await query.answer(reason_removed, show_alert=False) # Notify user why it was removed
+            except Exception as discount_recalc_err:
+                logger.error(f"Error recalculating total for discount revalidation after removal: {discount_recalc_err}")
+
+    # 4. Refresh basket view regardless of success/failure to show current state
+    await handle_view_basket(update, context)
 # --- END handle_remove_from_basket ---
 
 

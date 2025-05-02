@@ -39,8 +39,8 @@ import user # Ensure user module is imported
 try:
     from reseller_management import get_reseller_discount
 except ImportError:
-    logger_dummy_reseller = logging.getLogger(__name__ + "_dummy_reseller_payment")
-    logger_dummy_reseller.error("Could not import get_reseller_discount from reseller_management.py. Reseller discounts will not work in payment processing.")
+    logger_dummy_reseller_payment = logging.getLogger(__name__ + "_dummy_reseller_payment")
+    logger_dummy_reseller_payment.error("Could not import get_reseller_discount from reseller_management.py. Reseller discounts will not work in payment processing.")
     # Define a dummy function that always returns zero discount
     def get_reseller_discount(user_id: int, product_type: str) -> Decimal:
         return Decimal('0.0')
@@ -207,7 +207,14 @@ async def create_nowpayments_payment(
                  if status_code == 400 and "AMOUNT_MINIMAL_ERROR" in error_content:
                      logger.warning(f"NOWPayments rejected payment for {order_id} due to amount minimal error (API check).")
                      min_amount_fallback = f"{min_amount_api:.8f}".rstrip('0').rstrip('.')
-                     return {'error': 'amount_too_low_api', 'currency': pay_currency_code.upper(), 'min_amount': min_amount_fallback, 'crypto_amount': f"{invoice_crypto_amount:.8f}".rstrip('0').rstrip('.'), 'target_eur_amount': target_eur_amount}
+                     # Return specific error information
+                     return {
+                         'error': 'amount_too_low_api',
+                         'currency': pay_currency_code.upper(),
+                         'min_amount': min_amount_fallback,
+                         'crypto_amount': f"{invoice_crypto_amount:.8f}".rstrip('0').rstrip('.'),
+                         'target_eur_amount': target_eur_amount # Pass original EUR target
+                     }
                  return {'error': 'api_request_failed', 'details': str(e), 'status': status_code, 'content': error_content[:200]}
             except Exception as e:
                  logger.error(f"Unexpected error during NOWPayments payment API call for order {order_id}: {e}", exc_info=True)
@@ -317,7 +324,7 @@ async def handle_select_refill_crypto(update: Update, context: ContextTypes.DEFA
         elif error_code == 'api_key_invalid': error_message_to_user = error_api_key_msg
         elif error_code == 'invalid_api_response': error_message_to_user = error_invalid_response_msg
         elif error_code == 'pending_db_error': error_message_to_user = error_pending_db_msg
-        elif error_code == 'amount_too_low_api': # Should ideally not happen for refill unless min deposit is very high
+        elif error_code == 'amount_too_low_api': # Handle specific error with details
              min_amount_val = payment_result.get('min_amount', 'N/A'); crypto_amount_val = payment_result.get('crypto_amount', 'N/A')
              target_eur_val = payment_result.get('target_eur_amount', refill_eur_amount_decimal)
              error_message_to_user = error_amount_too_low_api_msg.format(target_eur_amount=format_currency(target_eur_val), currency=payment_result.get('currency', selected_asset_code.upper()), crypto_amount=crypto_amount_val, min_amount=min_amount_val)
@@ -862,11 +869,13 @@ async def _finalize_purchase(user_id: int, basket_snapshot: list, discount_code_
                 conn_del = get_db_connection()
                 c_del = conn_del.cursor()
                 ids_tuple_list = [(pid,) for pid in processed_product_ids]
+                # >>> ADD DETAILED LOGGING BEFORE DELETE <<<
+                logger.info(f"Purchase Finalization: Attempting to delete product records for user {user_id}. IDs: {processed_product_ids}")
                 # Delete only product records, keep media records and files intact on disk
                 delete_result = c_del.executemany("DELETE FROM products WHERE id = ?", ids_tuple_list)
                 conn_del.commit()
                 deleted_count = delete_result.rowcount
-                logger.info(f"Deleted {deleted_count} purchased product records for user {user_id}.")
+                logger.info(f"Deleted {deleted_count} purchased product records for user {user_id}. IDs: {processed_product_ids}") # Log again after success
             except sqlite3.Error as e: logger.error(f"DB error deleting purchased products: {e}", exc_info=True); conn_del.rollback() if conn_del and conn_del.in_transaction else None
             except Exception as e: logger.error(f"Unexpected error deleting purchased products: {e}", exc_info=True)
             finally:
@@ -910,6 +919,10 @@ async def process_purchase_with_balance(user_id: int, amount_to_deduct: Decimal,
         if not current_balance_result or Decimal(str(current_balance_result['balance'])) < amount_to_deduct:
              logger.warning(f"Insufficient balance user {user_id}. Needed: {amount_to_deduct:.2f}")
              conn.rollback()
+             # --- Unreserve items if balance check fails ---
+             logger.info(f"Un-reserving items for user {user_id} due to insufficient balance during payment.")
+             _unreserve_basket_items(basket_snapshot) # Sync call
+             # --- End Unreserve ---
              if chat_id: await send_message_with_retry(context.bot, chat_id, balance_changed_error, parse_mode=None)
              return False
         # 2. Deduct balance
@@ -932,9 +945,32 @@ async def process_purchase_with_balance(user_id: int, amount_to_deduct: Decimal,
         logger.info(f"Calling _finalize_purchase for user {user_id} after balance deduction.")
         # Now call the shared finalization logic
         finalize_success = await _finalize_purchase(user_id, basket_snapshot, discount_code_used, context)
+        if not finalize_success:
+            # Critical issue: Balance deducted but finalization failed.
+            # Attempt to refund balance or notify admin. Refunding is safer.
+            logger.critical(f"CRITICAL: Balance deducted for user {user_id} but _finalize_purchase FAILED! Attempting to refund.")
+            refund_conn = None
+            try:
+                refund_conn = get_db_connection()
+                refund_c = refund_conn.cursor()
+                refund_c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount_float_to_deduct, user_id))
+                refund_conn.commit()
+                logger.info(f"Successfully refunded {amount_float_to_deduct} EUR to user {user_id} after finalization failure.")
+                if chat_id: await send_message_with_retry(context.bot, chat_id, error_processing_purchase_contact_support + " Balance refunded.", parse_mode=None)
+            except Exception as refund_e:
+                logger.critical(f"CRITICAL REFUND FAILED for user {user_id}: {refund_e}. Manual balance correction required.")
+                if ADMIN_ID and chat_id: # Notify admin if refund fails
+                    await send_message_with_retry(context.bot, ADMIN_ID, f"⚠️ CRITICAL REFUND FAILED for user {user_id} after purchase finalization error. Amount: {amount_to_deduct}. MANUAL CORRECTION NEEDED!", parse_mode=None)
+                if chat_id: await send_message_with_retry(context.bot, chat_id, error_processing_purchase_contact_support, parse_mode=None)
+            finally:
+                if refund_conn: refund_conn.close()
         return finalize_success
     else:
         logger.error(f"Skipping purchase finalization for user {user_id} due to balance deduction failure.")
+        # --- Unreserve items if balance deduction failed ---
+        logger.info(f"Un-reserving items for user {user_id} due to balance deduction failure.")
+        _unreserve_basket_items(basket_snapshot) # Sync call
+        # --- End Unreserve ---
         if chat_id: await send_message_with_retry(context.bot, chat_id, error_processing_purchase_contact_support, parse_mode=None)
         return False
 
@@ -967,7 +1003,7 @@ async def process_successful_crypto_purchase(user_id: int, basket_snapshot: list
         logger.error(f"CRITICAL: Crypto payment {payment_id} success for user {user_id}, but _finalize_purchase failed! Items paid for but not processed in DB correctly.")
         if ADMIN_ID and chat_id:
             try:
-                await send_message_with_retry(context.bot, ADMIN_ID, f"⚠️ Critical Issue: Crypto payment {payment_id} success for user {user_id}, but finalization FAILED! Manual check/correction needed.", parse_mode=None)
+                await send_message_with_retry(context.bot, ADMIN_ID, f"⚠️ Critical Issue: Crypto payment {payment_id} success for user {user_id}, but finalization FAILED! Check logs! MANUAL INTERVENTION REQUIRED.", parse_mode=None)
             except Exception as admin_notify_e:
                  logger.error(f"Failed to notify admin about critical finalization failure: {admin_notify_e}")
         if chat_id:

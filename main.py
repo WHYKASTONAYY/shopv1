@@ -87,6 +87,9 @@ from admin import (
     handle_adm_broadcast_target_type, handle_adm_broadcast_target_city, handle_adm_broadcast_target_status,
     handle_adm_broadcast_inactive_days_message, # Message handler
     # ----------------------------
+    # <<< ADDED: Import Clear Reservations Handler >>>
+    handle_adm_clear_reservations_confirm,
+    # <<< END ADDED >>>
     handle_confirm_yes,
     handle_adm_add_city_message,
     handle_adm_add_district_message, handle_adm_edit_district_message,
@@ -102,8 +105,6 @@ from admin import (
     handle_adm_add_welcome_start,
     handle_adm_edit_welcome,
     handle_adm_delete_welcome_confirm,
-    handle_adm_welcome_template_name_message, # Message handler
-    handle_adm_welcome_template_text_message,   # Message handler
     handle_adm_edit_welcome_text,           # <<< Add this import
     handle_reset_default_welcome,         # <<< Add this import
     # <<< NEW Welcome Save/Preview Handlers (if needed directly, usually not) >>>
@@ -245,6 +246,9 @@ def callback_query_router(func):
                 "adm_delete_discount": handle_adm_delete_discount, "adm_add_discount_start": handle_adm_add_discount_start,
                 "adm_use_generated_code": handle_adm_use_generated_code, "adm_set_discount_type": handle_adm_set_discount_type,
                 "adm_set_media": handle_adm_set_media,
+                # <<< ADDED: Map the clear reservations callback >>>
+                "adm_clear_reservations_confirm": handle_adm_clear_reservations_confirm,
+                # <<< END ADDED >>>
                 "confirm_yes": handle_confirm_yes,
                 # --- Broadcast Handlers ---
                 "adm_broadcast_start": handle_adm_broadcast_start,
@@ -498,7 +502,7 @@ async def clear_expired_baskets_job_wrapper(context: ContextTypes.DEFAULT_TYPE):
     try:
         # Run the synchronous DB operation in a separate thread
         await asyncio.to_thread(clear_all_expired_baskets)
-        logger.info("Background job: Cleared expired baskets.")
+        # logger.info("Background job: Cleared expired baskets.") # Reduced log frequency
     except Exception as e:
         logger.error(f"Error in background job clear_expired_baskets_job: {e}", exc_info=True)
 

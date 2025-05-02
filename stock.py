@@ -43,17 +43,19 @@ async def handle_view_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         conn = get_db_connection() # Use helper
         # row_factory is set in helper
         c = conn.cursor()
-        # Fetch all products currently available (available > reserved)
+        # Fetch all products that have *any* stock (available OR reserved)
         # Use column names
+        # >>> MODIFIED QUERY HERE <<<
         c.execute("""
             SELECT city, district, product_type, size, price, available, reserved
-            FROM products WHERE available > reserved
+            FROM products WHERE available > 0 OR reserved > 0
             ORDER BY city, district, product_type, price, size
         """)
+        # >>> END MODIFICATION <<<
         products = c.fetchall()
 
         if not products:
-            msg = "📦 Bot Stock\n\nNo products currently in stock."
+            msg = "📦 Bot Stock\n\nNo products currently in stock (neither available nor reserved)." # Clarified message
             back_callback = "admin_menu" if is_primary_admin else "viewer_admin_menu"
             keyboard = [[InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data=back_callback)]]
         else:
@@ -75,6 +77,9 @@ async def handle_view_stock(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                         items.sort(key=lambda x: x[1]) # Sort by price (index 1)
                         for size, price, avail, res in items:
                             price_str = format_currency(price)
+                            # Ensure display reflects reality (Avail cannot be less than Reserved after reservation)
+                            # Although the reservation logic should prevent Avail < Reserved, this adds safety.
+                            # It's generally better to rely on the actual DB values.
                             msg += f"      - {size} ({price_str} €) | Av: {avail} / Res: {res}\n"
                     msg += "\n" # Add a newline between product types
                 msg += "\n" # Add a newline between districts

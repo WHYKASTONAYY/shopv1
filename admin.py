@@ -438,7 +438,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
        "Select an action:"
     )
 
-    # <<< UPDATED Keyboard with Added Products Log >>>
+    # <<< ADDED Clear Reservations Button >>>
     keyboard = [
         [InlineKeyboardButton("📊 Sales Analytics", callback_data="sales_analytics_menu")],
         [InlineKeyboardButton("➕ Add Products", callback_data="adm_city")],
@@ -449,11 +449,12 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         [InlineKeyboardButton("🏷️ Manage Discount Codes", callback_data="adm_manage_discounts")],
         [InlineKeyboardButton("👋 Manage Welcome Msg", callback_data="adm_manage_welcome|0")],
         [InlineKeyboardButton("📦 View Bot Stock", callback_data="view_stock")],
-        [InlineKeyboardButton("📜 View Added Products Log", callback_data="viewer_added_products|0")], # <<< ADDED HERE
+        [InlineKeyboardButton("📜 View Added Products Log", callback_data="viewer_added_products|0")],
         [InlineKeyboardButton("🗺️ Manage Districts", callback_data="adm_manage_districts")],
         [InlineKeyboardButton("🏙️ Manage Cities", callback_data="adm_manage_cities")],
         [InlineKeyboardButton("🧩 Manage Product Types", callback_data="adm_manage_types")],
         [InlineKeyboardButton("🚫 Manage Reviews", callback_data="adm_manage_reviews|0")],
+        [InlineKeyboardButton("🧹 Clear ALL Reservations", callback_data="adm_clear_reservations_confirm")], # <<< ADDED
         [InlineKeyboardButton("📢 Broadcast Message", callback_data="adm_broadcast_start")],
         [InlineKeyboardButton("➕ Add New City", callback_data="adm_add_city")],
         [InlineKeyboardButton("📸 Set Bot Media", callback_data="adm_set_media")],
@@ -1904,7 +1905,21 @@ async def send_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str, media_fi
          logger.info(f"Broadcast finished. Target: {target_type}={target_value}. Success: {success_count}, Failed: {fail_count}, Blocked: {block_count}")
 
 
-# --- Confirmation Handler (WITH ADDED LOGGING) ---
+# <<< ADDED: Handler for Clear Reservations Confirmation Button >>>
+async def handle_adm_clear_reservations_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
+    """Shows confirmation prompt for clearing all reservations."""
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID: return await query.answer("Access Denied.", show_alert=True)
+
+    context.user_data["confirm_action"] = "clear_all_reservations"
+    msg = (f"⚠️ Confirm Action: Clear All Reservations\n\n"
+           f"Are you sure you want to clear ALL product reservations and empty ALL user baskets?\n\n"
+           f"🚨 This action cannot be undone and will affect all users!")
+    keyboard = [[InlineKeyboardButton("✅ Yes, Clear Reservations", callback_data="confirm_yes"),
+                 InlineKeyboardButton("❌ No, Cancel", callback_data="admin_menu")]]
+    await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=None)
+
+# --- Confirmation Handler ---
 async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Handles generic 'Yes' confirmation based on stored action in user_data."""
     query = update.callback_query
@@ -2111,6 +2126,20 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
             except (ValueError, IndexError) as param_err:
                 conn.rollback(); logger.error(f"Invalid params for delete reseller discount: {action_params} - {param_err}")
                 success_msg = "❌ Error processing request."; next_callback = "admin_menu"
+        # <<< ADDED: Clear All Reservations Logic >>>
+        elif action_type == "clear_all_reservations":
+            logger.warning(f"ADMIN ACTION: Admin {user_id} is clearing ALL reservations and baskets.")
+            # Update products table
+            update_products_res = c.execute("UPDATE products SET reserved = 0 WHERE reserved > 0")
+            products_cleared = update_products_res.rowcount if update_products_res else 0
+            # Update users table
+            update_users_res = c.execute("UPDATE users SET basket = '' WHERE basket IS NOT NULL AND basket != ''")
+            baskets_cleared = update_users_res.rowcount if update_users_res else 0
+            conn.commit()
+            # Log the action
+            log_admin_action(admin_id=user_id, action="CLEAR_ALL_RESERVATIONS", reason=f"Cleared {products_cleared} reservations and {baskets_cleared} user baskets.")
+            success_msg = f"✅ Cleared {products_cleared} product reservations and emptied {baskets_cleared} user baskets."
+            next_callback = "admin_menu"
         # <<< END ADDED >>>
         else: # Unknown action type
             logger.error(f"Unknown confirmation action type: {action_type}")

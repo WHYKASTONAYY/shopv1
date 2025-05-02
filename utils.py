@@ -1139,7 +1139,7 @@ def _unreserve_basket_items(basket_snapshot: list | None):
     if not basket_snapshot:
         return
 
-    product_ids_to_release_counts = Counter(item['product_id'] for item in basket_snapshot)
+    product_ids_to_release_counts = Counter(item['product_id'] for item in basket_snapshot if 'product_id' in item)
     if not product_ids_to_release_counts:
         return
 
@@ -1336,6 +1336,7 @@ def get_user_status(purchases):
         else: return "New 🌱"
     except (ValueError, TypeError): return "New 🌱"
 
+# --- Modified clear_expired_basket (Individual user focus) ---
 def clear_expired_basket(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     if 'basket' not in context.user_data: context.user_data['basket'] = []
     conn = None
@@ -1346,9 +1347,12 @@ def clear_expired_basket(context: ContextTypes.DEFAULT_TYPE, user_id: int):
         c.execute("SELECT basket FROM users WHERE user_id = ?", (user_id,))
         result = c.fetchone(); basket_str = result['basket'] if result else ''
         if not basket_str:
+            # If DB basket is empty, ensure context basket is also empty
             if context.user_data.get('basket'): context.user_data['basket'] = []
             if context.user_data.get('applied_discount'): context.user_data.pop('applied_discount', None)
-            c.execute("COMMIT"); return
+            c.execute("COMMIT"); # Commit potential state change from BEGIN
+            return # Exit early if no basket string in DB
+
         items = basket_str.split(',')
         current_time = time.time(); valid_items_str_list = []; valid_items_userdata_list = []
         expired_product_ids_counts = Counter(); expired_items_found = False
@@ -1357,70 +1361,159 @@ def clear_expired_basket(context: ContextTypes.DEFAULT_TYPE, user_id: int):
             if item_part and ':' in item_part:
                 try: potential_prod_ids.append(int(item_part.split(':')[0]))
                 except ValueError: logger.warning(f"Invalid product ID format in basket string '{item_part}' for user {user_id}")
-        product_prices = {}
+
+        product_details = {}
         if potential_prod_ids:
              placeholders = ','.join('?' * len(potential_prod_ids))
-             # <<< FETCH product_type as well >>>
+             # Fetch product_type along with price
              c.execute(f"SELECT id, price, product_type FROM products WHERE id IN ({placeholders})", potential_prod_ids)
-             # <<< Store price and type >>>
-             product_prices = {row['id']: {'price': Decimal(str(row['price'])), 'type': row['product_type']} for row in c.fetchall()}
+             product_details = {row['id']: {'price': Decimal(str(row['price'])), 'type': row['product_type']} for row in c.fetchall()}
+
         for item_str in items:
             if not item_str: continue
             try:
                 prod_id_str, ts_str = item_str.split(':'); prod_id = int(prod_id_str); ts = float(ts_str)
                 if current_time - ts <= BASKET_TIMEOUT:
                     valid_items_str_list.append(item_str)
-                    if prod_id in product_prices:
-                        # <<< Add product_type to context item >>>
+                    details = product_details.get(prod_id)
+                    if details:
+                        # Add product_type to context item
                         valid_items_userdata_list.append({
                             "product_id": prod_id,
-                            "price": product_prices[prod_id]['price'], # Original price
-                            "product_type": product_prices[prod_id]['type'],
+                            "price": details['price'], # Original price
+                            "product_type": details['type'], # Store product type
                             "timestamp": ts
                         })
-                    else: logger.warning(f"P{prod_id} price/type not found during basket validation (user {user_id}).")
-                else: expired_product_ids_counts[prod_id] += 1; expired_items_found = True
+                    else: logger.warning(f"P{prod_id} details not found during basket validation (user {user_id}).")
+                else:
+                    expired_product_ids_counts[prod_id] += 1
+                    expired_items_found = True
             except (ValueError, IndexError) as e: logger.warning(f"Malformed item '{item_str}' in basket for user {user_id}: {e}")
+
         if expired_items_found:
             new_basket_str = ','.join(valid_items_str_list)
             c.execute("UPDATE users SET basket = ? WHERE user_id = ?", (new_basket_str, user_id))
             if expired_product_ids_counts:
                 decrement_data = [(count, pid) for pid, count in expired_product_ids_counts.items()]
                 c.executemany("UPDATE products SET reserved = MAX(0, reserved - ?) WHERE id = ?", decrement_data)
-        c.execute("COMMIT")
+                logger.info(f"Released {sum(expired_product_ids_counts.values())} reservations for user {user_id} due to expiry.")
+
+        c.execute("COMMIT") # Commit transaction
         context.user_data['basket'] = valid_items_userdata_list
         if not valid_items_userdata_list and context.user_data.get('applied_discount'):
             context.user_data.pop('applied_discount', None); logger.info(f"Cleared discount for user {user_id} as basket became empty.")
-    except sqlite3.Error as e: logger.error(f"SQLite error clearing basket user {user_id}: {e}", exc_info=True); conn.rollback() if conn and conn.in_transaction else None
-    except Exception as e: logger.error(f"Unexpected error clearing basket user {user_id}: {e}", exc_info=True)
-    finally: conn.close() if conn else None
 
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error clearing basket user {user_id}: {e}", exc_info=True)
+        if conn and conn.in_transaction: conn.rollback()
+    except Exception as e:
+        logger.error(f"Unexpected error clearing basket user {user_id}: {e}", exc_info=True)
+        if conn and conn.in_transaction: conn.rollback()
+    finally:
+        if conn: conn.close()
+
+# --- MODIFIED clear_all_expired_baskets (Individual user processing) ---
 def clear_all_expired_baskets():
-    logger.info("Running scheduled job: clear_all_expired_baskets")
-    all_expired_product_counts = Counter(); user_basket_updates = []
-    conn = None
+    logger.info("Running scheduled job: clear_all_expired_baskets (Improved)")
+    all_expired_product_counts = Counter()
+    processed_user_count = 0
+    failed_user_count = 0
+    conn_outer = None
+    users_to_process = []
+
+    # 1. Fetch all users with baskets first
     try:
-        conn = get_db_connection()
-        c = conn.cursor(); c.execute("BEGIN"); c.execute("SELECT user_id, basket FROM users WHERE basket IS NOT NULL AND basket != ''")
-        users_with_baskets = c.fetchall(); current_time = time.time()
-        for user_row in users_with_baskets:
-            user_id = user_row['user_id']; basket_str = user_row['basket']; items = basket_str.split(','); valid_items_str_list = []; user_had_expired = False
-            for item_str in items:
-                if not item_str: continue
-                try:
-                    prod_id_str, ts_str = item_str.split(':'); prod_id = int(prod_id_str); ts = float(ts_str)
-                    if current_time - ts <= BASKET_TIMEOUT: valid_items_str_list.append(item_str)
-                    else: all_expired_product_counts[prod_id] += 1; user_had_expired = True
-                except (ValueError, IndexError) as e: logger.warning(f"Malformed item '{item_str}' user {user_id} global clear: {e}")
-            if user_had_expired: new_basket_str = ','.join(valid_items_str_list); user_basket_updates.append((new_basket_str, user_id))
-        if user_basket_updates: c.executemany("UPDATE users SET basket = ? WHERE user_id = ?", user_basket_updates); logger.info(f"Scheduled clear: Updated baskets for {len(user_basket_updates)} users.")
+        conn_outer = get_db_connection()
+        c_outer = conn_outer.cursor()
+        c_outer.execute("SELECT user_id, basket FROM users WHERE basket IS NOT NULL AND basket != ''")
+        users_to_process = c_outer.fetchall() # Fetch all relevant users
+    except sqlite3.Error as e:
+        logger.error(f"Failed to fetch users for basket clearing job: {e}", exc_info=True)
+        return # Cannot proceed if user fetch fails
+    finally:
+        if conn_outer: conn_outer.close()
+
+    if not users_to_process:
+        logger.info("Scheduled clear: No users with active baskets found.")
+        return
+
+    logger.info(f"Scheduled clear: Found {len(users_to_process)} users with baskets to check.")
+    current_time = time.time()
+    user_basket_updates = [] # Batch updates for user basket strings
+
+    # 2. Process each user individually for basket string updates and count expired items
+    for user_row in users_to_process:
+        user_id = user_row['user_id']
+        basket_str = user_row['basket']
+        items = basket_str.split(',')
+        valid_items_str_list = []
+        user_had_expired = False
+        user_error = False
+
+        for item_str in items:
+            if not item_str: continue
+            try:
+                prod_id_str, ts_str = item_str.split(':')
+                prod_id = int(prod_id_str)
+                ts = float(ts_str)
+                if current_time - ts <= BASKET_TIMEOUT:
+                    valid_items_str_list.append(item_str)
+                else:
+                    all_expired_product_counts[prod_id] += 1
+                    user_had_expired = True
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Malformed item '{item_str}' user {user_id} in global clear: {e}")
+                # Decide whether to keep malformed items or discard them
+                # Let's discard them to clean up potentially bad data
+                user_error = True # Mark user had an error, but continue processing others
+                # Optionally, keep the malformed item if preferred: valid_items_str_list.append(item_str)
+                continue # Skip this malformed item
+
+        if user_error:
+            failed_user_count += 1
+
+        # Only add to batch update if expired items were found for this user
+        if user_had_expired:
+            new_basket_str = ','.join(valid_items_str_list)
+            user_basket_updates.append((new_basket_str, user_id))
+
+        processed_user_count += 1
+        # Optional: Add a small sleep if processing many users to avoid bursts
+        # await asyncio.sleep(0.01) # Requires making function async
+
+    # 3. Perform batch updates outside the user loop
+    conn_update = None
+    try:
+        conn_update = get_db_connection()
+        c_update = conn_update.cursor()
+        c_update.execute("BEGIN") # Start transaction for batch updates
+
+        # Update user basket strings
+        if user_basket_updates:
+            c_update.executemany("UPDATE users SET basket = ? WHERE user_id = ?", user_basket_updates)
+            logger.info(f"Scheduled clear: Updated basket strings for {len(user_basket_updates)} users.")
+
+        # Decrement reservations
         if all_expired_product_counts:
             decrement_data = [(count, pid) for pid, count in all_expired_product_counts.items()]
-            if decrement_data: c.executemany("UPDATE products SET reserved = MAX(0, reserved - ?) WHERE id = ?", decrement_data); total_released = sum(all_expired_product_counts.values()); logger.info(f"Scheduled clear: Released {total_released} expired product reservations.")
-        conn.commit()
-    except sqlite3.Error as e: logger.error(f"SQLite error in scheduled job clear_all_expired_baskets: {e}", exc_info=True); conn.rollback() if conn and conn.in_transaction else None
-    except Exception as e: logger.error(f"Unexpected error in clear_all_expired_baskets: {e}", exc_info=True)
-    finally: conn.close() if conn else None
+            if decrement_data:
+                c_update.executemany("UPDATE products SET reserved = MAX(0, reserved - ?) WHERE id = ?", decrement_data)
+                total_released = sum(all_expired_product_counts.values())
+                logger.info(f"Scheduled clear: Released {total_released} expired product reservations.")
+
+        conn_update.commit() # Commit all updates together
+
+    except sqlite3.Error as e:
+        logger.error(f"SQLite error during batch updates in clear_all_expired_baskets: {e}", exc_info=True)
+        if conn_update and conn_update.in_transaction: conn_update.rollback()
+    except Exception as e:
+        logger.error(f"Unexpected error during batch updates in clear_all_expired_baskets: {e}", exc_info=True)
+        if conn_update and conn_update.in_transaction: conn_update.rollback()
+    finally:
+        if conn_update: conn_update.close()
+
+    logger.info(f"Scheduled job clear_all_expired_baskets finished. Processed: {processed_user_count}, Users with errors: {failed_user_count}, Total items un-reserved: {sum(all_expired_product_counts.values())}")
+
 
 def fetch_last_purchases(user_id, limit=10):
     try:

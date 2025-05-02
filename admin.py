@@ -1904,7 +1904,7 @@ async def send_broadcast(context: ContextTypes.DEFAULT_TYPE, text: str, media_fi
          logger.info(f"Broadcast finished. Target: {target_type}={target_value}. Success: {success_count}, Failed: {fail_count}, Blocked: {block_count}")
 
 
-# --- Confirmation Handler ---
+# --- Confirmation Handler (WITH ADDED LOGGING) ---
 async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE, params=None):
     """Handles generic 'Yes' confirmation based on stored action in user_data."""
     query = update.callback_query
@@ -1941,6 +1941,9 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
              if city_name:
                  c.execute("SELECT id FROM products WHERE city = ?", (city_name,))
                  product_ids_to_delete = [row['id'] for row in c.fetchall()] # Use column name
+                 # >>> ADDED LOGGING <<<
+                 logger.info(f"Admin Action (delete_city): Deleting city '{city_name}'. Associated product IDs to be deleted: {product_ids_to_delete}")
+                 # >>> END LOGGING <<<
                  if product_ids_to_delete:
                      placeholders = ','.join('?' * len(product_ids_to_delete))
                      c.execute(f"DELETE FROM product_media WHERE product_id IN ({placeholders})", product_ids_to_delete)
@@ -1949,7 +1952,7 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           if await asyncio.to_thread(os.path.exists, media_dir_to_del):
                               asyncio.create_task(asyncio.to_thread(shutil.rmtree, media_dir_to_del, ignore_errors=True))
                               logger.info(f"Scheduled deletion of media dir: {media_dir_to_del}")
-                 c.execute("DELETE FROM products WHERE city = ?", (city_name,))
+                 c.execute("DELETE FROM products WHERE city = ?", (city_name,)) # Actual product deletion
                  c.execute("DELETE FROM districts WHERE city_id = ?", (city_id_int,))
                  delete_city_result = c.execute("DELETE FROM cities WHERE id = ?", (city_id_int,))
                  if delete_city_result.rowcount > 0:
@@ -1969,6 +1972,9 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
              if city_name and district_name:
                  c.execute("SELECT id FROM products WHERE city = ? AND district = ?", (city_name, district_name))
                  product_ids_to_delete = [row['id'] for row in c.fetchall()] # Use column name
+                 # >>> ADDED LOGGING <<<
+                 logger.info(f"Admin Action (remove_district): Deleting district '{district_name}' in '{city_name}'. Associated product IDs to be deleted: {product_ids_to_delete}")
+                 # >>> END LOGGING <<<
                  if product_ids_to_delete:
                      placeholders = ','.join('?' * len(product_ids_to_delete))
                      c.execute(f"DELETE FROM product_media WHERE product_id IN ({placeholders})", product_ids_to_delete)
@@ -1977,7 +1983,7 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
                           if await asyncio.to_thread(os.path.exists, media_dir_to_del):
                               asyncio.create_task(asyncio.to_thread(shutil.rmtree, media_dir_to_del, ignore_errors=True))
                               logger.info(f"Scheduled deletion of media dir: {media_dir_to_del}")
-                 c.execute("DELETE FROM products WHERE city = ? AND district = ?", (city_name, district_name))
+                 c.execute("DELETE FROM products WHERE city = ? AND district = ?", (city_name, district_name)) # Actual product deletion
                  delete_dist_result = c.execute("DELETE FROM districts WHERE id = ? AND city_id = ?", (dist_id_int, city_id_int))
                  if delete_dist_result.rowcount > 0:
                      conn.commit(); load_all_data()
@@ -1991,8 +1997,11 @@ async def handle_confirm_yes(update: Update, context: ContextTypes.DEFAULT_TYPE,
              product_id = int(action_params[0])
              c.execute("SELECT ci.id as city_id, di.id as dist_id, p.product_type FROM products p LEFT JOIN cities ci ON p.city = ci.name LEFT JOIN districts di ON p.district = di.name AND ci.id = di.city_id WHERE p.id = ?", (product_id,))
              back_details_tuple = c.fetchone() # Result is already a Row object
+             # >>> ADDED LOGGING <<<
+             logger.info(f"Admin Action (confirm_remove_product): Deleting product ID {product_id}")
+             # >>> END LOGGING <<<
              c.execute("DELETE FROM product_media WHERE product_id = ?", (product_id,))
-             delete_prod_result = c.execute("DELETE FROM products WHERE id = ?", (product_id,))
+             delete_prod_result = c.execute("DELETE FROM products WHERE id = ?", (product_id,)) # Actual product deletion
              if delete_prod_result.rowcount > 0:
                   conn.commit()
                   success_msg = f"✅ Product ID {product_id} removed!"
@@ -3437,5 +3446,3 @@ async def handle_adm_welcome_description_edit_message(update: Update, context: C
     context.user_data.pop("editing_welcome_template_name", None) # Clean up specific edit state
     context.user_data.pop("editing_welcome_field", None) # Clean up field indicator
     await _show_welcome_preview(update, context)
-
-# --- END OF FILE admin.py ---

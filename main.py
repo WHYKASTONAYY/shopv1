@@ -91,6 +91,7 @@ from admin import (
     handle_adm_clear_reservations_confirm,
     # <<< END ADDED >>>
     handle_confirm_yes,
+    # --- Admin Message Handlers (Imported below based on state) ---
     handle_adm_add_city_message,
     handle_adm_add_district_message, handle_adm_edit_district_message,
     handle_adm_edit_city_message, handle_adm_custom_size_message, handle_adm_price_message,
@@ -99,21 +100,22 @@ from admin import (
     handle_adm_edit_type_emoji_message, # <-- Import new type emoji edit handler
     process_discount_code_input, handle_adm_discount_code_message, handle_adm_discount_value_message,
     handle_adm_manage_reviews, handle_adm_delete_review_confirm,
-    # <<< Welcome Message Handlers >>>
+    # <<< Welcome Message Handlers (Callbacks/Buttons) >>>
     handle_adm_manage_welcome,
     handle_adm_activate_welcome,
     handle_adm_add_welcome_start,
     handle_adm_edit_welcome,
     handle_adm_delete_welcome_confirm,
-    handle_adm_edit_welcome_text,           # <<< Add this import
-    handle_reset_default_welcome,         # <<< Add this import
-    # <<< NEW Welcome Save/Preview Handlers (if needed directly, usually not) >>>
-    # _show_welcome_preview, # Usually internal to admin.py
-    handle_confirm_save_welcome,          # <<< Add this import (for save button)
-    # <<< NEW Description Edit Handlers (if needed directly, usually not) >>>
-    handle_adm_edit_welcome_desc,           # <<< Add this import
-    handle_adm_welcome_description_message, # Message Handler
-    handle_adm_welcome_description_edit_message # Message Handler
+    handle_adm_edit_welcome_text,
+    handle_reset_default_welcome,
+    handle_confirm_save_welcome,
+    handle_adm_edit_welcome_desc,
+    # <<< Welcome Message Handlers (State-based Messages) - ADDED HERE >>>
+    handle_adm_welcome_template_name_message,
+    handle_adm_welcome_template_text_message,
+    handle_adm_welcome_description_message,
+    handle_adm_welcome_description_edit_message
+    # <<< END ADDED >>>
 )
 from viewer_admin import (
     handle_viewer_admin_menu,
@@ -325,6 +327,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get('state')
     logger.debug(f"Message received from user {user_id}, state: {state}")
 
+    # <<< MODIFIED: Include the missing welcome message handlers >>>
     STATE_HANDLERS = {
         'awaiting_review': handle_leave_review_message,
         'awaiting_user_discount_code': handle_user_discount_code_message,
@@ -348,11 +351,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'awaiting_discount_code': handle_adm_discount_code_message,
         'awaiting_discount_value': handle_adm_discount_value_message,
         # --- Welcome Message States ---
-        'awaiting_welcome_template_name': handle_adm_welcome_template_name_message,
-        'awaiting_welcome_template_text': handle_adm_welcome_template_text_message,
-        'awaiting_welcome_template_edit': handle_adm_welcome_template_text_message,
-        'awaiting_welcome_description': handle_adm_welcome_description_message, # <<< ADDED
-        'awaiting_welcome_description_edit': handle_adm_welcome_description_edit_message, # <<< ADDED
+        'awaiting_welcome_template_name': handle_adm_welcome_template_name_message,   # <<< WAS MISSING
+        'awaiting_welcome_template_text': handle_adm_welcome_template_text_message,   # <<< WAS MISSING
+        'awaiting_welcome_template_edit': handle_adm_welcome_template_text_message,   # <<< WAS MISSING (Reuses text handler)
+        'awaiting_welcome_description': handle_adm_welcome_description_message,       # <<< WAS MISSING
+        'awaiting_welcome_description_edit': handle_adm_welcome_description_edit_message, # <<< WAS MISSING
         'awaiting_welcome_confirmation': None, # Handled by callback (confirm_save_welcome)
         # ----------------------------
         # --- Refill ---
@@ -368,6 +371,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'awaiting_reseller_discount_percent': handle_reseller_percent_message,
         # -------------------------------- # <<< END ADDED
     }
+    # <<< END MODIFICATION >>>
 
     handler_func = STATE_HANDLERS.get(state)
     if handler_func:
@@ -448,6 +452,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
              if 'clear_expired_basket' in str(context.error):
                  logger.error("Error likely due to missing import in payment.py.")
                  error_message = "An internal processing error occurred (payment). Please try again."
+             # Check if it's related to the welcome message handlers
+             elif 'handle_adm_welcome_' in str(context.error):
+                  logger.error("Error likely due to missing welcome message handler import in main.py.")
+                  error_message = "An internal processing error occurred (welcome msg). Please try again."
              else:
                  error_message = "An internal processing error occurred. Please try again or contact support if it persists."
         elif isinstance(context.error, AttributeError): # Catch the specific AttributeError
